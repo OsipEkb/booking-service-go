@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -93,7 +94,7 @@ func (s *BookingsService) Cancel(ctx context.Context, id int64) error {
 		return err
 	}
 
-	if err := booking.Cancel(time.Now()); err != nil {
+	if err := booking.StartCancellation(time.Now()); err != nil {
 		return err
 	}
 
@@ -114,7 +115,6 @@ func (s *BookingsService) Cancel(ctx context.Context, id int64) error {
 }
 
 // Confirm подтверждает бронирование по ID.
-// Используется обработчиком событий RabbitMQ.
 func (s *BookingsService) Confirm(ctx context.Context, id int64) error {
 	booking, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -124,12 +124,65 @@ func (s *BookingsService) Confirm(ctx context.Context, id int64) error {
 	if err := booking.Confirm(); err != nil {
 		return err
 	}
-
 	if err := s.repo.Update(ctx, booking); err != nil {
-		return fmt.Errorf("обновление бронирования: %w", err)
+		return fmt.Errorf("обновление статуса бронирования при подтверждении создания: %w", err)
+	}
+	s.logger.Info("бронирование успешно подтверждено (создано)", zap.Int64("id", id))
+	return nil
+}
+
+func (s *BookingsService) HandleCancellationConfirmed(ctx context.Context, id int64) error {
+	booking, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := booking.ConfirmCancellation(); err != nil {
+		return err
+	}
+	if err := s.repo.Update(ctx, booking); err != nil {
+		return fmt.Errorf("обновление статуса бронирования при подтверждении отмены: %w", err)
+	}
+	s.logger.Info("отмена бронирования успешно подтверждена", zap.Int64("id", id))
+	return nil
+}
+
+func (s *BookingsService) HandleCancelError(ctx context.Context, requestID string) error {
+	bookingID, err := messaging.RequestIDToBookingID(requestID)
+	if err != nil {
+		// Если мы даже не смогли распарсить ID, то и искать в базе нечего.
+		// Залогируем это и вернем nil, чтобы битое сообщение удалилось из очереди.
+		s.logger.Error("критическая ошибка: не удалось распарсить requestID в DLQ", zap.String("requestId", requestID), zap.Error(err))
+		return nil
 	}
 
-	s.logger.Info("бронирование подтверждено", zap.Int64("id", id))
-
+	booking, err := s.repo.GetByID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, models.ErrBookingNotFound) {
+			s.logger.Warn("бронирование для отката не найдено в БД, пропускаем сообщение", zap.Int64("id", bookingID))
+			return nil // Возвращаем nil, чтобы сообщение ушло из очереди
+		}
+		return fmt.Errorf("получение бронирования из БД id=%d: %w", bookingID, err)
+	}
+	if err := booking.RollbackCancellation(); err != nil {
+		return err
+	}
+	if err := s.repo.Update(ctx, booking); err != nil {
+		return fmt.Errorf("откат отмены бронирования в БД id=%d: %w", bookingID, err)
+	}
+	s.logger.Info("отмена бронирования откатана назад", zap.Int64("id", bookingID))
+	return nil
+}
+func (s *BookingsService) ConfirmCancellation(ctx context.Context, id int64) error {
+	booking, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := booking.ConfirmCancellation(); err != nil {
+		return err
+	}
+	if err := s.repo.Update(ctx, booking); err != nil {
+		return fmt.Errorf("подтверждение отмены бронирования в БД id=%d: %w", id, err)
+	}
+	s.logger.Info("отмена бронирования успешно подтверждена", zap.Int64("id", id))
 	return nil
 }

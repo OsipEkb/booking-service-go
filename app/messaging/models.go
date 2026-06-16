@@ -43,14 +43,16 @@ type BookingJobDenied struct {
 
 // Routing keys для входящих событий от Catalog (consumer side, Rebus convention).
 const (
-	RoutingKeyBookingJobConfirmed = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobConfirmed, BookingService.Catalog.Async.Api.Contracts"
-	RoutingKeyBookingJobDenied    = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobDenied, BookingService.Catalog.Async.Api.Contracts"
+	RoutingKeyBookingJobConfirmed   = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobConfirmed, BookingService.Catalog.Async.Api.Contracts"
+	RoutingKeyBookingJobDenied      = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobDenied, BookingService.Catalog.Async.Api.Contracts"
+	RoutingKeyCancelBookingJobError = "BookingService.Catalog.Async.Api.Contracts.Requests.CancelBookingJobByRequestIdRequest, BookingService.Catalog.Async.Api.Contracts.Errors"
 )
 
 // QueueSuffixes для входящих событий — читаемые имена суффиксов очередей.
 const (
 	QueueSuffixBookingJobConfirmed = "booking-job.confirmed"
 	QueueSuffixBookingJobDenied    = "booking-job.denied"
+	QueueSuffixCancelBookingError  = "cancel-booking.error"
 )
 
 // Routing keys и типы для исходящих команд в Catalog (publisher side, Rebus convention).

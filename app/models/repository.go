@@ -1,6 +1,9 @@
 package models
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // BookingRepository -- интерфейс репозитория бронирований.
 type BookingRepository interface {
@@ -28,6 +31,22 @@ type BookingFilter struct {
 	Status     *BookingStatus
 	Page       int
 	Size       int
+}
+type TopResource struct {
+	ResourceID   int64 `json:"resourceId"`
+	BookingCount int64 `json:"bookingCount"`
+}
+
+// BookingStatistics содержит общую аналитику за период.
+type BookingStatistics struct {
+	TotalCount   int64                   `json:"totalCount"`
+	StatusCounts map[BookingStatus]int64 `json:"statusCounts"`
+	TopResources []TopResource           `json:"topResources"`
+}
+
+// BookingQueriesRepository — выделенный интерфейс для аналитических выборок (CQRS).
+type BookingQueriesRepository interface {
+	GetStatistics(ctx context.Context, dateFrom, dateTo time.Time) (*BookingStatistics, error)
 }
 
 // NewDefaultFilter создаёт фильтр с пагинацией по умолчанию.

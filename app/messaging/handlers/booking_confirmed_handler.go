@@ -8,19 +8,22 @@ import (
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
+	"booking-service/app/models"
 	"booking-service/app/service"
 )
 
 // BookingConfirmedHandler обрабатывает события BookingJobConfirmed.
 type BookingConfirmedHandler struct {
 	service *service.BookingsService
+	queries *service.BookingsQueries
 	logger  *zap.Logger
 }
 
 // NewBookingConfirmedHandler создаёт новый обработчик.
-func NewBookingConfirmedHandler(svc *service.BookingsService, logger *zap.Logger) *BookingConfirmedHandler {
+func NewBookingConfirmedHandler(svc *service.BookingsService, queries *service.BookingsQueries, logger *zap.Logger) *BookingConfirmedHandler {
 	return &BookingConfirmedHandler{
 		service: svc,
+		queries: queries,
 		logger:  logger,
 	}
 }
@@ -41,6 +44,15 @@ func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error
 		zap.Int64("bookingId", bookingID),
 		zap.Int64("catalogJobId", event.Id),
 	)
+
+	currentStatus, err := h.queries.GetStatus(ctx, bookingID)
+	if err == nil {
+		if currentStatus == models.BookingStatusCancellationPending {
+			h.logger.Warn("Обнаружен Race Condition: Catalog подтвердил бронирование, находящееся в статусе отмены",
+				zap.Int64("bookingId", bookingID),
+			)
+		}
+	}
 
 	if err := h.service.Confirm(ctx, bookingID); err != nil {
 		return fmt.Errorf("подтверждение бронирования %d: %w", bookingID, err)

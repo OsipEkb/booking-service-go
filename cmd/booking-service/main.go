@@ -1,6 +1,7 @@
 package main
 
 import (
+	"booking-service/app/worker"
 	"context"
 	"errors"
 	"fmt"
@@ -65,7 +66,7 @@ func main() {
 
 	// Сервисный слой
 	bookingsService := service.NewBookingsService(repo, publisher, logger)
-	bookingsQueries := service.NewBookingsQueries(repo, logger)
+	bookingsQueries := service.NewBookingsQueries(repo, repo, logger)
 
 	// Catalog-клиент
 	catalogClient := catalog.NewClient(
@@ -78,17 +79,29 @@ func main() {
 	_ = catalogClient
 
 	// Хендлеры событий RabbitMQ
-	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, logger)
+	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, bookingsQueries, logger)
 	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, logger)
+	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, logger)
 
 	// Контекст для graceful shutdown фоновых задач
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cancellationWorker := worker.NewCancellationWorker(
+		repo,
+		publisher,
+		cfg.Worker.CancellationInterval,
+		cfg.Worker.CancellationTimeout,
+		cfg.Worker.ConfirmationBatch,
+		logger,
+	)
+
+	go cancellationWorker.Run(ctx)
 	// Consumer
 	consumer := messaging.NewConsumer(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.QueuePrefix, logger)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobConfirmed, messaging.RoutingKeyBookingJobConfirmed, confirmedHandler.Handle)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobDenied, messaging.RoutingKeyBookingJobDenied, deniedHandler.Handle)
+	consumer.Subscribe(messaging.QueueSuffixCancelBookingError, messaging.RoutingKeyCancelBookingJobError, cancelErrorHandler.Handle)
 
 	if err := consumer.Start(ctx); err != nil {
 		logger.Error("не удалось запустить consumer", zap.Error(err))

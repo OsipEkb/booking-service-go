@@ -22,6 +22,8 @@ func NewRouter(bookingsHandler *handler.BookingsHandler) chi.Router {
 
 	// Маршруты бронирований
 	r.Route("/api/bookings", func(r chi.Router) {
+		r.Get("/statistics", bookingsHandler.GetStatistics) // GET  api/bookings/statistics
+
 		r.Post("/create", bookingsHandler.Create)         // POST api/bookings/create
 		r.Post("/by-filter", bookingsHandler.GetByFilter) // POST api/bookings/by-filter
 		r.Get("/{id}", bookingsHandler.GetByID)           // GET  api/bookings/{id}

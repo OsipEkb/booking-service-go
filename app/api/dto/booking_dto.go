@@ -54,5 +54,21 @@ type ProblemDetails struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+type TopResourceDTO struct {
+	ResourceID   int64 `json:"resourceId"`
+	BookingCount int64 `json:"bookingCount"`
+}
+
+type BookingStatisticsResponse struct {
+	TotalCount   int64            `json:"totalCount"`
+	StatusCounts map[string]int64 `json:"statusCounts"`
+	TopResources []TopResourceDTO `json:"topResources"`
+}
+
+type BookingStatisticsRequest struct {
+	DateFrom string
+	DateTo   string
+}
+
 // DateFormat -- формат даты для JSON-сериализации.
 const DateFormat = "2006-01-02"

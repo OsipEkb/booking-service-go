@@ -1,10 +1,14 @@
 package handlers
 
 import (
+	"booking-service/app/models"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
@@ -14,13 +18,15 @@ import (
 // BookingDeniedHandler обрабатывает события BookingJobDenied.
 type BookingDeniedHandler struct {
 	service *service.BookingsService
+	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
 // NewBookingDeniedHandler создаёт новый обработчик.
-func NewBookingDeniedHandler(svc *service.BookingsService, logger *zap.Logger) *BookingDeniedHandler {
+func NewBookingDeniedHandler(svc *service.BookingsService, repo models.BookingRepository, logger *zap.Logger) *BookingDeniedHandler {
 	return &BookingDeniedHandler{
 		service: svc,
+		repo:    repo,
 		logger:  logger,
 	}
 }
@@ -42,6 +48,30 @@ func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 		zap.Int64("catalogJobId", event.Id),
 		zap.String("reason", event.Reason),
 	)
+	eventIDStr := strconv.FormatInt(event.Id, 10)
+	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
+
+		if err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingDenied"); err != nil {
+			var pgErr *pgconn.PgError
+
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				h.logger.Warn("событие уже обработано (дубликат)", zap.String("eventId", eventIDStr))
+				return nil
+			}
+
+			return err
+		}
+
+		if err := h.service.Cancel(txCtx, bookingID); err != nil {
+			return fmt.Errorf("отмена бронирования %d: %w", bookingID, err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("ошибка транзакции при отмене бронирования: %w", err)
+	}
 
 	if err := h.service.Cancel(ctx, bookingID); err != nil {
 		return fmt.Errorf("отмена бронирования %d: %w", bookingID, err)

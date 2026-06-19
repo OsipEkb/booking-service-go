@@ -26,6 +26,7 @@ type BookingRepository interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
 	SaveAuditLog(ctx context.Context, log *BookingAuditLog) error
 	GetAuditLogsByBookingID(ctx context.Context, bookingID int64, page int, size int) ([]BookingAuditLog, int64, error)
+	RegisterEvent(ctx context.Context, eventID string, eventType string) error
 }
 
 // BookingFilter содержит параметры фильтрации и пагинации.

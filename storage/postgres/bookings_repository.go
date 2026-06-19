@@ -381,3 +381,15 @@ func (r *BookingsRepository) GetAuditLogsByBookingID(ctx context.Context, bookin
 
 	return logs, totalCount, rows.Err()
 }
+
+func (r *BookingsRepository) RegisterEvent(ctx context.Context, eventID string, eventType string) error {
+	query := `
+        INSERT INTO processed_events (event_id, event_type, processed_at)
+        VALUES ($1, $2, $3)`
+
+	_, err := r.getExecutor(ctx).Exec(ctx, query, eventID, eventType, time.Now())
+	if err != nil {
+		return fmt.Errorf("регистрация события %s: %w", eventID, err)
+	}
+	return nil
+}

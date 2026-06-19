@@ -79,8 +79,8 @@ func main() {
 	_ = catalogClient
 
 	// Хендлеры событий RabbitMQ
-	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, bookingsQueries, logger)
-	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, logger)
+	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, bookingsQueries, repo, logger)
+	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, repo, logger)
 	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, logger)
 
 	// Контекст для graceful shutdown фоновых задач

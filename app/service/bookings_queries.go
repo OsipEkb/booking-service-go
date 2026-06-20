@@ -93,7 +93,7 @@ func (q *BookingsQueries) GetByFilter(ctx context.Context, req dto.GetBookingsBy
 	}, nil
 }
 
-// mapBookingToResponse конвертирует доменный объект в DTO ответа.
+// mapBookingToResponse конвертирует доменный объект в DTO ответа..
 func mapBookingToResponse(b *models.Booking) dto.BookingResponse {
 	return dto.BookingResponse{
 		ID:         b.ID(),

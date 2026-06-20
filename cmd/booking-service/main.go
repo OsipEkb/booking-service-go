@@ -81,7 +81,7 @@ func main() {
 	// Хендлеры событий RabbitMQ
 	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, bookingsQueries, repo, logger)
 	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, repo, logger)
-	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, logger)
+	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, repo, logger)
 
 	// Контекст для graceful shutdown фоновых задач
 	ctx, cancel := context.WithCancel(context.Background())

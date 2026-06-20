@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
@@ -50,7 +49,7 @@ func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error
 		zap.Int64("catalogJobId", event.Id),
 	)
 
-	eventIDStr := strconv.FormatInt(event.Id, 10)
+	eventIDStr := event.EventId
 
 	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
 

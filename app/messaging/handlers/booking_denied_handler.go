@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
@@ -45,20 +44,18 @@ func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 
 	h.logger.Info("получено событие BookingJobDenied",
 		zap.Int64("bookingId", bookingID),
-		zap.Int64("catalogJobId", event.Id),
-		zap.String("reason", event.Reason),
+		zap.String("eventId", event.EventId),
 	)
-	eventIDStr := strconv.FormatInt(event.Id, 10)
-	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
 
+	eventIDStr := event.EventId
+
+	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
 		if err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingDenied"); err != nil {
 			var pgErr *pgconn.PgError
-
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 				h.logger.Warn("событие уже обработано (дубликат)", zap.String("eventId", eventIDStr))
 				return nil
 			}
-
 			return err
 		}
 
@@ -71,10 +68,6 @@ func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 
 	if err != nil {
 		return fmt.Errorf("ошибка транзакции при отмене бронирования: %w", err)
-	}
-
-	if err := h.service.Cancel(ctx, bookingID); err != nil {
-		return fmt.Errorf("отмена бронирования %d: %w", bookingID, err)
 	}
 
 	h.logger.Info("бронирование отменено через событие",

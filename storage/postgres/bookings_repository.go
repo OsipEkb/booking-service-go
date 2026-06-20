@@ -41,6 +41,10 @@ func NewBookingsRepository(pool *pgxpool.Pool) *BookingsRepository {
 
 // WithTx запускает переданную функцию внутри ACID транзакции базы данных
 func (r *BookingsRepository) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
+		return fn(ctx)
+	}
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)

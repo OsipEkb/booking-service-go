@@ -1,27 +1,23 @@
 package handlers
 
 import (
-	"booking-service/app/models"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
+	"booking-service/app/models"
 	"booking-service/app/service"
 )
 
-// BookingDeniedHandler обрабатывает события BookingJobDenied.
 type BookingDeniedHandler struct {
 	service *service.BookingsService
 	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
-// NewBookingDeniedHandler создаёт новый обработчик.
 func NewBookingDeniedHandler(svc *service.BookingsService, repo models.BookingRepository, logger *zap.Logger) *BookingDeniedHandler {
 	return &BookingDeniedHandler{
 		service: svc,
@@ -30,7 +26,6 @@ func NewBookingDeniedHandler(svc *service.BookingsService, repo models.BookingRe
 	}
 }
 
-// Handle обрабатывает событие отклонения бронирования.
 func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.BookingJobDenied
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -50,13 +45,13 @@ func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 	eventIDStr := event.EventId
 
 	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
-		if err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingDenied"); err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				h.logger.Warn("событие уже обработано (дубликат)", zap.String("eventId", eventIDStr))
-				return nil
-			}
+		isNew, err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingDenied")
+		if err != nil {
 			return err
+		}
+		if !isNew {
+			h.logger.Warn("событие уже обработано (дубликат), пропускаем", zap.String("eventId", eventIDStr))
+			return nil
 		}
 
 		if err := h.service.Cancel(txCtx, bookingID); err != nil {

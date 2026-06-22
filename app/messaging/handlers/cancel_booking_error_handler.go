@@ -3,10 +3,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
@@ -14,14 +12,12 @@ import (
 	"booking-service/app/service"
 )
 
-// CancelBookingErrorHandler обрабатывает ошибки отмены бронирования из DLQ.
 type CancelBookingErrorHandler struct {
 	service *service.BookingsService
 	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
-// NewCancelBookingErrorHandler создаёт новый обработчик.
 func NewCancelBookingErrorHandler(svc *service.BookingsService, repo models.BookingRepository, logger *zap.Logger) *CancelBookingErrorHandler {
 	return &CancelBookingErrorHandler{
 		service: svc,
@@ -30,7 +26,6 @@ func NewCancelBookingErrorHandler(svc *service.BookingsService, repo models.Book
 	}
 }
 
-// Handle обрабатывает событие ошибки отмены бронирования (выполняет rollback).
 func (h *CancelBookingErrorHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.CancelBookingJobCommand
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -43,16 +38,15 @@ func (h *CancelBookingErrorHandler) Handle(ctx context.Context, body []byte) err
 	)
 
 	err := h.repo.WithTx(ctx, func(txCtx context.Context) error {
-
-		if err := h.repo.RegisterEvent(txCtx, event.EventId, "CancelBookingError"); err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				h.logger.Warn("событие ошибки отмены уже обработано (дубликат)", zap.String("eventId", event.EventId))
-				return nil
-			}
+		isNew, err := h.repo.RegisterEvent(txCtx, event.EventId, "CancelBookingError")
+		if err != nil {
 			return err
 		}
-		
+		if !isNew {
+			h.logger.Warn("событие ошибки отмены уже обработано (дубликат), пропускаем", zap.String("eventId", event.EventId))
+			return nil
+		}
+
 		if err := h.service.HandleCancelError(txCtx, event.RequestId); err != nil {
 			return fmt.Errorf("ошибка при выполнении отката для requestId=%s: %w", event.RequestId, err)
 		}

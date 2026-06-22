@@ -94,7 +94,7 @@ func (w *CancellationWorker) processBooking(ctx context.Context, booking *models
 	requestID := messaging.BookingIDToRequestID(bookingID)
 
 	err := w.publisher.PublishCancelBookingJob(ctx, messaging.CancelBookingJobCommand{
-		EventId:   "",
+		EventId:   messaging.NewMessageID(),
 		RequestId: requestID,
 	})
 

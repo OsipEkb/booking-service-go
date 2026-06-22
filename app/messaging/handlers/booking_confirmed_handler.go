@@ -3,10 +3,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
@@ -14,7 +12,6 @@ import (
 	"booking-service/app/service"
 )
 
-// BookingConfirmedHandler обрабатывает события BookingJobConfirmed.
 type BookingConfirmedHandler struct {
 	service *service.BookingsService
 	queries *service.BookingsQueries
@@ -22,7 +19,6 @@ type BookingConfirmedHandler struct {
 	logger  *zap.Logger
 }
 
-// NewBookingConfirmedHandler создаёт новый обработчик.
 func NewBookingConfirmedHandler(svc *service.BookingsService, queries *service.BookingsQueries, repo models.BookingRepository, logger *zap.Logger) *BookingConfirmedHandler {
 	return &BookingConfirmedHandler{
 		service: svc,
@@ -32,7 +28,6 @@ func NewBookingConfirmedHandler(svc *service.BookingsService, queries *service.B
 	}
 }
 
-// Handle обрабатывает событие подтверждения бронирования.
 func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.BookingJobConfirmed
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -46,27 +41,19 @@ func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error
 
 	h.logger.Info("получено событие BookingJobConfirmed",
 		zap.Int64("bookingId", bookingID),
-		zap.Int64("catalogJobId", event.Id),
+		zap.String("eventId", event.EventId),
 	)
 
 	eventIDStr := event.EventId
 
 	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
-
-		if err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingConfirmed"); err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				h.logger.Warn("событие уже обработано (дубликат)", zap.String("eventId", eventIDStr))
-				return nil
-			}
+		isNew, err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingConfirmed")
+		if err != nil {
 			return err
 		}
-
-		currentStatus, err := h.queries.GetStatus(txCtx, bookingID)
-		if err == nil && currentStatus == models.BookingStatusCancellationPending {
-			h.logger.Warn("Обнаружен Race Condition: Catalog подтвердил бронирование, находящееся в статусе отмены",
-				zap.Int64("bookingId", bookingID),
-			)
+		if !isNew {
+			h.logger.Warn("событие уже обработано (дубликат), пропускаем", zap.String("eventId", eventIDStr))
+			return nil
 		}
 
 		if err := h.service.Confirm(txCtx, bookingID); err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CreateBookingJobCommand -- команда на создание задания в Catalog.
@@ -40,12 +41,21 @@ type BookingJobDenied struct {
 	RequestId string `json:"RequestId"` // BookingID в формате UUID
 	Reason    string `json:"Reason"`
 }
+type BookingStatusChangedEvent struct {
+	EventId   string    `json:"eventId"`
+	BookingId int64     `json:"bookingId"`
+	OldStatus string    `json:"oldStatus"`
+	NewStatus string    `json:"newStatus"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	Reason    string    `json:"reason"`
+}
 
 // Routing keys для входящих событий от Catalog (consumer side, Rebus convention).
 const (
 	RoutingKeyBookingJobConfirmed   = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobConfirmed, BookingService.Catalog.Async.Api.Contracts"
 	RoutingKeyBookingJobDenied      = "BookingService.Catalog.Async.Api.Contracts.Events.BookingJobDenied, BookingService.Catalog.Async.Api.Contracts"
 	RoutingKeyCancelBookingJobError = "BookingService.Catalog.Async.Api.Contracts.Requests.CancelBookingJobByRequestIdRequest, BookingService.Catalog.Async.Api.Contracts.Errors"
+	RoutingKeyBookingStatusChanged  = "BookingService.Booking.Events.BookingStatusChangedEvent, BookingService.Booking.Events"
 )
 
 // QueueSuffixes для входящих событий — читаемые имена суффиксов очередей.

@@ -62,6 +62,45 @@ func main() {
 	}
 	defer mqConn.Close()
 
+	err = mqConn.Channel().ExchangeDeclare(
+		cfg.RabbitMQ.BookingDomainEventsExchange,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось объявить exchange для доменных событий", zap.Error(err))
+		os.Exit(1)
+	}
+
+	_, err = mqConn.Channel().QueueDeclare(
+		cfg.RabbitMQ.BookingStatusEventsQueue,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось объявить очередь для доменных событий", zap.Error(err))
+		os.Exit(1)
+	}
+
+	err = mqConn.Channel().QueueBind(
+		cfg.RabbitMQ.BookingStatusEventsQueue,
+		messaging.RoutingKeyBookingStatusChanged,
+		cfg.RabbitMQ.BookingDomainEventsExchange,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось связать очередь доменных событий с exchange", zap.Error(err))
+		os.Exit(1)
+	}
+
 	publisher := messaging.NewPublisher(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.PublisherExchangeName, logger)
 
 	// Сервисный слой

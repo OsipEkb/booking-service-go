@@ -14,7 +14,7 @@ import (
 	"booking-service/app/models"
 )
 
-// BookingsService обрабатывает команды (изменение состояния) для бронирований.
+// BookingsService обрабатывает команды (изменение состояния) для бронирования.
 type BookingsService struct {
 	repo      models.BookingRepository
 	publisher *messaging.Publisher
@@ -135,6 +135,17 @@ func (s *BookingsService) Cancel(ctx context.Context, id int64) error {
 
 	s.logger.Info("бронирование отменено", zap.Int64("id", id))
 
+	if err := s.publisher.PublishBookingStatusChanged(ctx, messaging.BookingStatusChangedEvent{
+		EventId:   messaging.NewMessageID(),
+		BookingId: booking.ID(),
+		OldStatus: string(oldStatus),
+		NewStatus: string(booking.Status()),
+		UpdatedAt: time.Now(),
+		Reason:    "Cancellation requested by user",
+	}); err != nil {
+		s.logger.Error("ошибка публикации BookingStatusChangedEvent при отмене", zap.Error(err), zap.Int64("bookingId", id))
+	}
+
 	if err := s.publisher.PublishCancelBookingJob(ctx, messaging.CancelBookingJobCommand{
 		EventId:   messaging.NewMessageID(),
 		RequestId: messaging.BookingIDToRequestID(id),
@@ -183,6 +194,18 @@ func (s *BookingsService) Confirm(ctx context.Context, id int64) error {
 	}
 
 	s.logger.Info("бронирование успешно подтверждено (создано)", zap.Int64("id", id))
+
+	if err := s.publisher.PublishBookingStatusChanged(ctx, messaging.BookingStatusChangedEvent{
+		EventId:   messaging.NewMessageID(),
+		BookingId: booking.ID(),
+		OldStatus: string(oldStatus),
+		NewStatus: string(booking.Status()),
+		UpdatedAt: time.Now(),
+		Reason:    "Booking confirmed by system",
+	}); err != nil {
+		s.logger.Error("ошибка публикации BookingStatusChangedEvent при подтверждении", zap.Error(err), zap.Int64("bookingId", id))
+	}
+
 	return nil
 }
 
@@ -234,5 +257,17 @@ func (s *BookingsService) HandleCancelError(ctx context.Context, requestID strin
 	}
 
 	s.logger.Info("отмена бронирования откатана назад", zap.Int64("id", bookingID))
+
+	if err := s.publisher.PublishBookingStatusChanged(ctx, messaging.BookingStatusChangedEvent{
+		EventId:   messaging.NewMessageID(),
+		BookingId: booking.ID(),
+		OldStatus: string(oldStatus),
+		NewStatus: string(booking.Status()),
+		UpdatedAt: time.Now(),
+		Reason:    "Rollback cancellation due to external processing failure",
+	}); err != nil {
+		s.logger.Error("ошибка публикации BookingStatusChangedEvent при откате отмены", zap.Error(err), zap.Int64("bookingId", bookingID))
+	}
+
 	return nil
 }

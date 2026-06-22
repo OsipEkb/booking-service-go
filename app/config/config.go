@@ -46,14 +46,19 @@ type CatalogConfig struct {
 type WorkerConfig struct {
 	ConfirmationInterval time.Duration `envconfig:"WORKER_CONFIRMATION_INTERVAL" default:"30s"`
 	ConfirmationBatch    int           `envconfig:"WORKER_CONFIRMATION_BATCH" default:"10"`
+
+	CancellationInterval time.Duration `envconfig:"WORKER_CANCELLATION_INTERVAL" default:"30s"`
+	CancellationTimeout  time.Duration `envconfig:"WORKER_CANCELLATION_TIMEOUT" default:"5m"`
 }
 
 type RabbitMQConfig struct {
-	URL                   string `envconfig:"RABBITMQ_URL" default:"amqp://admin:admin@localhost:5672/"`
-	ExchangeName          string `envconfig:"RABBITMQ_EXCHANGE" default:"booking-service"`
-	PublisherExchangeName string `envconfig:"RABBITMQ_PUBLISHER_EXCHANGE" default:"booking-service-topics"`
-	QueuePrefix           string `envconfig:"RABBITMQ_QUEUE_PREFIX" default:"booking-service"`
-	PrefetchCount         int    `envconfig:"RABBITMQ_PREFETCH_COUNT" default:"10"`
+	URL                         string `envconfig:"RABBITMQ_URL" default:"amqp://admin:admin@localhost:5672/"`
+	ExchangeName                string `envconfig:"RABBITMQ_EXCHANGE" default:"booking-service"`
+	PublisherExchangeName       string `envconfig:"RABBITMQ_PUBLISHER_EXCHANGE" default:"booking-service-topics"`
+	BookingDomainEventsExchange string `envconfig:"RABBITMQ_DOMAIN_EVENTS_EXCHANGE" default:"booking-domain-events"`
+	BookingStatusEventsQueue    string `envconfig:"RABBITMQ_STATUS_EVENTS_QUEUE" default:"booking-domain-events.booking-status-events"`
+	QueuePrefix                 string `envconfig:"RABBITMQ_QUEUE_PREFIX" default:"booking-service"`
+	PrefetchCount               int    `envconfig:"RABBITMQ_PREFETCH_COUNT" default:"10"`
 }
 
 func (p PostgresConfig) DSN() string {

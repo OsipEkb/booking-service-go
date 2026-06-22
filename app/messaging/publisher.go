@@ -114,3 +114,34 @@ func (p *Publisher) publishToCatalog(ctx context.Context, routingKey string, mes
 
 	return nil
 }
+
+func (p *Publisher) PublishBookingStatusChanged(ctx context.Context, event BookingStatusChangedEvent) error {
+	body, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("сериализация BookingStatusChangedEvent: %w", err)
+	}
+
+	err = p.conn.Channel().PublishWithContext(
+		ctx,
+		"booking-domain-events",
+		RoutingKeyBookingStatusChanged,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("публикация доменного события (bookingId: %d): %w", event.BookingId, err)
+	}
+
+	p.logger.Debug("доменное событие изменения статуса опубликовано",
+		zap.Int64("bookingId", event.BookingId),
+		zap.String("routingKey", RoutingKeyBookingStatusChanged),
+		zap.String("body", string(body)),
+	)
+
+	return nil
+}

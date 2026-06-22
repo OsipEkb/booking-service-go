@@ -1,6 +1,7 @@
 package main
 
 import (
+	"booking-service/app/worker"
 	"context"
 	"errors"
 	"fmt"
@@ -61,11 +62,50 @@ func main() {
 	}
 	defer mqConn.Close()
 
+	err = mqConn.Channel().ExchangeDeclare(
+		cfg.RabbitMQ.BookingDomainEventsExchange,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось объявить exchange для доменных событий", zap.Error(err))
+		os.Exit(1)
+	}
+
+	_, err = mqConn.Channel().QueueDeclare(
+		cfg.RabbitMQ.BookingStatusEventsQueue,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось объявить очередь для доменных событий", zap.Error(err))
+		os.Exit(1)
+	}
+
+	err = mqConn.Channel().QueueBind(
+		cfg.RabbitMQ.BookingStatusEventsQueue,
+		messaging.RoutingKeyBookingStatusChanged,
+		cfg.RabbitMQ.BookingDomainEventsExchange,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("не удалось связать очередь доменных событий с exchange", zap.Error(err))
+		os.Exit(1)
+	}
+
 	publisher := messaging.NewPublisher(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.PublisherExchangeName, logger)
 
 	// Сервисный слой
 	bookingsService := service.NewBookingsService(repo, publisher, logger)
-	bookingsQueries := service.NewBookingsQueries(repo, logger)
+	bookingsQueries := service.NewBookingsQueries(repo, repo, logger)
 
 	// Catalog-клиент
 	catalogClient := catalog.NewClient(
@@ -78,17 +118,29 @@ func main() {
 	_ = catalogClient
 
 	// Хендлеры событий RabbitMQ
-	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, logger)
-	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, logger)
+	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, bookingsQueries, repo, logger)
+	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, repo, logger)
+	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, repo, logger)
 
 	// Контекст для graceful shutdown фоновых задач
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cancellationWorker := worker.NewCancellationWorker(
+		repo,
+		publisher,
+		cfg.Worker.CancellationInterval,
+		cfg.Worker.CancellationTimeout,
+		cfg.Worker.ConfirmationBatch,
+		logger,
+	)
+
+	go cancellationWorker.Run(ctx)
 	// Consumer
 	consumer := messaging.NewConsumer(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.QueuePrefix, logger)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobConfirmed, messaging.RoutingKeyBookingJobConfirmed, confirmedHandler.Handle)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobDenied, messaging.RoutingKeyBookingJobDenied, deniedHandler.Handle)
+	consumer.Subscribe(messaging.QueueSuffixCancelBookingError, messaging.RoutingKeyCancelBookingJobError, cancelErrorHandler.Handle)
 
 	if err := consumer.Start(ctx); err != nil {
 		logger.Error("не удалось запустить consumer", zap.Error(err))

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"booking-service/app/service"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,8 @@ type BookingQueries interface {
 	GetByID(ctx context.Context, id int64) (dto.BookingResponse, error)
 	GetByFilter(ctx context.Context, req dto.GetBookingsByFilterRequest) (dto.PagedResponse[dto.BookingResponse], error)
 	GetStatus(ctx context.Context, id int64) (models.BookingStatus, error)
+	GetStatistics(ctx context.Context, req dto.BookingStatisticsRequest) (dto.BookingStatisticsResponse, error)
+	GetAuditLogs(ctx context.Context, bookingID int64, page, size int) (dto.PagedResponse[dto.BookingAuditLogResponse], error)
 }
 
 // BookingsHandler содержит обработчики HTTP-запросов для бронирований.
@@ -170,4 +173,66 @@ func writeProblemDetails(w http.ResponseWriter, status int, title, detail string
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(pd)
+}
+
+func (h *BookingsHandler) GetStatistics(w http.ResponseWriter, r *http.Request) {
+	dateFromStr := r.URL.Query().Get("dateFrom")
+	dateToStr := r.URL.Query().Get("dateTo")
+
+	if dateFromStr == "" || dateToStr == "" {
+		writeProblemDetails(w, http.StatusBadRequest, "Ошибка валидации", "Параметры dateFrom и dateTo обязательны")
+		return
+	}
+
+	req := dto.BookingStatisticsRequest{
+		DateFrom: dateFromStr,
+		DateTo:   dateToStr,
+	}
+
+	stats, err := h.queries.GetStatistics(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidDateFormat) || errors.Is(err, service.ErrInvalidDateRange) {
+			writeProblemDetails(w, http.StatusBadRequest, "Ошибка валидации", err.Error())
+			return
+		}
+
+		h.logger.Error("Не удалось получить статистику бронирований", zap.Error(err))
+		writeProblemDetails(w, http.StatusInternalServerError, "Внутренняя ошибка сервера", "Произошел непредвиденный сбой на стороне сервера")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (h *BookingsHandler) GetAuditLogs(w http.ResponseWriter, r *http.Request) {
+	bookingID, err := parseIDParam(r)
+	if err != nil {
+		writeProblemDetails(w, http.StatusBadRequest, "Некорректный ID бронирования", err.Error())
+		return
+	}
+
+	pageStr := r.URL.Query().Get("page")
+	sizeStr := r.URL.Query().Get("size")
+
+	page := 1
+	if pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+
+	size := 10
+	if sizeStr != "" {
+		if s, err := strconv.Atoi(sizeStr); err == nil && s > 0 {
+			size = s
+		}
+	}
+
+	result, err := h.queries.GetAuditLogs(r.Context(), bookingID, page, size)
+	if err != nil {
+		h.handleServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }

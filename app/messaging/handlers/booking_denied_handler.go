@@ -8,24 +8,24 @@ import (
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
+	"booking-service/app/models"
 	"booking-service/app/service"
 )
 
-// BookingDeniedHandler обрабатывает события BookingJobDenied.
 type BookingDeniedHandler struct {
 	service *service.BookingsService
+	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
-// NewBookingDeniedHandler создаёт новый обработчик.
-func NewBookingDeniedHandler(svc *service.BookingsService, logger *zap.Logger) *BookingDeniedHandler {
+func NewBookingDeniedHandler(svc *service.BookingsService, repo models.BookingRepository, logger *zap.Logger) *BookingDeniedHandler {
 	return &BookingDeniedHandler{
 		service: svc,
+		repo:    repo,
 		logger:  logger,
 	}
 }
 
-// Handle обрабатывает событие отклонения бронирования.
 func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.BookingJobDenied
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -39,12 +39,30 @@ func (h *BookingDeniedHandler) Handle(ctx context.Context, body []byte) error {
 
 	h.logger.Info("получено событие BookingJobDenied",
 		zap.Int64("bookingId", bookingID),
-		zap.Int64("catalogJobId", event.Id),
-		zap.String("reason", event.Reason),
+		zap.String("eventId", event.EventId),
 	)
 
-	if err := h.service.Cancel(ctx, bookingID); err != nil {
-		return fmt.Errorf("отмена бронирования %d: %w", bookingID, err)
+	eventIDStr := event.EventId
+
+	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
+		isNew, err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingDenied")
+		if err != nil {
+			return err
+		}
+		if !isNew {
+			h.logger.Warn("событие уже обработано (дубликат), пропускаем", zap.String("eventId", eventIDStr))
+			return nil
+		}
+
+		if err := h.service.Cancel(txCtx, bookingID); err != nil {
+			return fmt.Errorf("отмена бронирования %d: %w", bookingID, err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("ошибка транзакции при отмене бронирования: %w", err)
 	}
 
 	h.logger.Info("бронирование отменено через событие",

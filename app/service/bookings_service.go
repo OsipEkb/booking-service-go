@@ -2,12 +2,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"booking-service/app/api/dto"
@@ -15,19 +15,40 @@ import (
 	"booking-service/app/models"
 )
 
-// BookingsService обрабатывает команды (изменение состояния) для бронирования.
+// OutboxSaver сохраняет доменные события в outbox для гарантированной доставки.
+type OutboxSaver interface {
+	SaveTx(ctx context.Context, tx pgx.Tx, event messaging.BookingStatusChangedEvent) error
+}
+
+// BookingsService обрабатывает команды (изменение состояния) для бронирований.
+//
+// Этот сервис -- оркестратор: он координирует домен и репозиторий,
+// но НЕ содержит бизнес-правила (они в models.Booking).
 type BookingsService struct {
-	repo      models.BookingRepository
-	publisher *messaging.Publisher
-	logger    *zap.Logger
+	repo               models.BookingRepository
+	historyRepo        models.BookingHistoryRepository
+	processedEventRepo models.ProcessedEventRepository
+	publisher          *messaging.Publisher
+	outboxSaver        OutboxSaver
+	logger             *zap.Logger
 }
 
 // NewBookingsService создаёт новый BookingsService.
-func NewBookingsService(repo models.BookingRepository, publisher *messaging.Publisher, logger *zap.Logger) *BookingsService {
+func NewBookingsService(
+	repo models.BookingRepository,
+	historyRepo models.BookingHistoryRepository,
+	processedEventRepo models.ProcessedEventRepository,
+	publisher *messaging.Publisher,
+	outboxSaver OutboxSaver,
+	logger *zap.Logger,
+) *BookingsService {
 	return &BookingsService{
-		repo:      repo,
-		publisher: publisher,
-		logger:    logger,
+		repo:               repo,
+		historyRepo:        historyRepo,
+		processedEventRepo: processedEventRepo,
+		publisher:          publisher,
+		outboxSaver:        outboxSaver,
+		logger:             logger,
 	}
 }
 
@@ -37,7 +58,6 @@ func (s *BookingsService) Create(ctx context.Context, req dto.CreateBookingReque
 	if err != nil {
 		return 0, fmt.Errorf("некорректный формат startDate: %w", err)
 	}
-
 	endDate, err := time.Parse(dto.DateFormat, req.EndDate)
 	if err != nil {
 		return 0, fmt.Errorf("некорректный формат endDate: %w", err)
@@ -48,34 +68,32 @@ func (s *BookingsService) Create(ctx context.Context, req dto.CreateBookingReque
 		return 0, err
 	}
 
-	var id int64
-
-	// Оборачиваем создание и самый первый лог аудита в транзакцию
-	err = s.repo.WithTx(ctx, func(txCtx context.Context) error {
-		var txErr error
-		id, txErr = s.repo.Create(txCtx, booking)
-		if txErr != nil {
-			return fmt.Errorf("сохранение бронирования: %w", txErr)
-		}
-
-		// Для нового бронирования начального статуса не было — передаем пустую строку ""
-		log := models.NewBookingAuditLog(
-			id,
-			"",
-			booking.Status(),
-			strconv.FormatInt(req.UserID, 10),
-			"Initial booking creation",
-		)
-
-		if txErr := s.repo.SaveAuditLog(txCtx, log); txErr != nil {
-			return fmt.Errorf("сохранение начального лога аудита: %w", txErr)
-		}
-
-		return nil
-	})
-
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("начало транзакции: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	id, err := s.repo.CreateTx(ctx, tx, booking)
+	if err != nil {
+		return 0, fmt.Errorf("сохранение бронирования: %w", err)
+	}
+
+	reason := "Booking created by user"
+	initiatedBy := fmt.Sprintf("%d", req.UserID)
+	if err := s.historyRepo.AddTx(ctx, tx, models.BookingHistoryEntry{
+		BookingID:   id,
+		OldStatus:   nil,
+		NewStatus:   models.BookingStatusAwaitsConfirmation,
+		ChangedAt:   time.Now(),
+		Reason:      &reason,
+		InitiatedBy: initiatedBy,
+	}); err != nil {
+		return 0, fmt.Errorf("запись истории: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("коммит транзакции: %w", err)
 	}
 
 	s.logger.Info("бронирование создано",
@@ -97,8 +115,14 @@ func (s *BookingsService) Create(ctx context.Context, req dto.CreateBookingReque
 	return id, nil
 }
 
-// Cancel отменяет бронирование по ID.
+// Cancel переводит бронирование в статус cancellation_pending.
 func (s *BookingsService) Cancel(ctx context.Context, id int64) error {
+	return s.cancelWithReason(ctx, id, "Cancelled by user request", "User", "")
+}
+
+// cancelWithReason — внутренняя реализация отмены.
+// eventID непустой только при вызове из обработчика событий (для идемпотентности).
+func (s *BookingsService) cancelWithReason(ctx context.Context, id int64, reason, initiatedBy, eventID string) error {
 	booking, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -110,75 +134,102 @@ func (s *BookingsService) Cancel(ctx context.Context, id int64) error {
 		return err
 	}
 
-	err = s.repo.WithTx(ctx, func(txCtx context.Context) error {
-		if txErr := s.repo.Update(txCtx, booking); txErr != nil {
-			return fmt.Errorf("обновление бронирования: %w", txErr)
-		}
-
-		log := models.NewBookingAuditLog(
-			booking.ID(),
-			oldStatus,
-			booking.Status(),
-			"User",
-			"Cancellation requested by user",
-		)
-
-		if txErr := s.repo.SaveAuditLog(txCtx, log); txErr != nil {
-			return fmt.Errorf("сохранение лога аудита отмены: %w", txErr)
-		}
-
-		event := messaging.BookingStatusChangedEvent{
-			EventId:   messaging.NewMessageID(),
-			BookingId: booking.ID(),
-			OldStatus: string(oldStatus),
-			NewStatus: string(booking.Status()),
-			UpdatedAt: time.Now(),
-			Reason:    "Cancellation requested by user",
-		}
-
-		payload, txErr := json.Marshal(event)
-		if txErr != nil {
-			return fmt.Errorf("сериализация события для outbox: %w", txErr)
-		}
-
-		outboxMsg := &models.OutboxMessage{
-			EventID:     event.EventId,
-			EventType:   "BookingStatusChangedEvent",
-			Payload:     payload,
-			Status:      "pending",
-			Attempts:    0,
-			MaxAttempts: 3,
-			CreatedAt:   time.Now(),
-		}
-
-		if txErr := s.repo.SaveOutboxMessage(txCtx, outboxMsg); txErr != nil {
-			return fmt.Errorf("сохранение события в outbox: %w", txErr)
-		}
-
-		return nil
-	})
-
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("начало транзакции: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.repo.UpdateTx(ctx, tx, booking); err != nil {
+		return fmt.Errorf("обновление бронирования: %w", err)
 	}
 
-	s.logger.Info("бронирование отменено, событие сохранено в outbox", zap.Int64("id", id))
-
-	if err := s.publisher.PublishCancelBookingJob(ctx, messaging.CancelBookingJobCommand{
-		EventId:   messaging.NewMessageID(),
-		RequestId: messaging.BookingIDToRequestID(id),
+	if err := s.historyRepo.AddTx(ctx, tx, models.BookingHistoryEntry{
+		BookingID:   id,
+		OldStatus:   &oldStatus,
+		NewStatus:   booking.Status(),
+		ChangedAt:   time.Now(),
+		Reason:      &reason,
+		InitiatedBy: initiatedBy,
 	}); err != nil {
-		s.logger.Error("ошибка публикации CancelBookingJob", zap.Error(err), zap.Int64("bookingId", id))
+		return fmt.Errorf("запись истории: %w", err)
+	}
+
+	if eventID != "" {
+		if err := s.markProcessedTx(ctx, tx, eventID); err != nil {
+			return err
+		}
+	}
+
+	if s.outboxSaver != nil {
+		if err := s.outboxSaver.SaveTx(ctx, tx, messaging.BookingStatusChangedEvent{
+			EventId:   messaging.NewMessageID(),
+			BookingId: id,
+			OldStatus: string(oldStatus),
+			NewStatus: string(booking.Status()),
+			ChangedAt: time.Now().UTC(),
+			Reason:    reason,
+		}); err != nil {
+			return fmt.Errorf("сохранение события в outbox: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("коммит транзакции: %w", err)
+	}
+
+	s.logger.Info("бронирование переведено в статус отмены", zap.Int64("id", id))
+
+	if s.publisher != nil {
+		if err := s.publisher.PublishCancelBookingJob(ctx, messaging.CancelBookingJobCommand{
+			EventId:   messaging.NewMessageID(),
+			RequestId: messaging.BookingIDToRequestID(id),
+		}); err != nil {
+			s.logger.Error("ошибка публикации CancelBookingJob", zap.Error(err), zap.Int64("bookingId", id))
+		}
 	}
 
 	return nil
 }
 
+// CancelFromEvent отменяет бронирование по событию от Catalog (BookingJobDenied).
+// eventID используется для идемпотентности: повторное событие игнорируется.
+func (s *BookingsService) CancelFromEvent(ctx context.Context, id int64, reason, eventID string) error {
+	if eventID != "" {
+		if dup, err := s.isDuplicate(ctx, eventID); err != nil {
+			return err
+		} else if dup {
+			return nil
+		}
+	}
+	return s.cancelWithReason(ctx, id, reason, "System", eventID)
+}
+
 // Confirm подтверждает бронирование по ID.
-func (s *BookingsService) Confirm(ctx context.Context, id int64) error {
+// eventID используется для идемпотентности: повторное событие игнорируется.
+// Передайте пустую строку, если вызов не из обработчика событий (например, из worker polling).
+func (s *BookingsService) Confirm(ctx context.Context, id int64, eventID string) error {
+	if eventID != "" {
+		if dup, err := s.isDuplicate(ctx, eventID); err != nil {
+			return err
+		} else if dup {
+			return nil
+		}
+	}
+	return s.confirmWithInitiator(ctx, id, "System", eventID)
+}
+
+// confirmWithInitiator — внутренняя реализация подтверждения.
+func (s *BookingsService) confirmWithInitiator(ctx context.Context, id int64, initiatedBy, eventID string) error {
 	booking, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return err
+	}
+
+	if booking.Status() == models.BookingStatusCancellationPending {
+		s.logger.Warn("race condition обнаружен: Catalog подтвердил бронирование, которое уже в процессе отмены; принимаем факт подтверждения для синхронизации с Catalog",
+			zap.Int64("id", id),
+		)
 	}
 
 	oldStatus := booking.Status()
@@ -187,137 +238,151 @@ func (s *BookingsService) Confirm(ctx context.Context, id int64) error {
 		return err
 	}
 
-	err = s.repo.WithTx(ctx, func(txCtx context.Context) error {
-		if txErr := s.repo.Update(txCtx, booking); txErr != nil {
-			return fmt.Errorf("обновление статуса бронирования при подтверждении создания: %w", txErr)
-		}
-
-		log := models.NewBookingAuditLog(
-			booking.ID(),
-			oldStatus,
-			booking.Status(),
-			"System",
-			"Booking confirmed by system",
-		)
-
-		if txErr := s.repo.SaveAuditLog(txCtx, log); txErr != nil {
-			return fmt.Errorf("сохранение лога аудита подтверждения: %w", txErr)
-		}
-
-		event := messaging.BookingStatusChangedEvent{
-			EventId:   messaging.NewMessageID(),
-			BookingId: booking.ID(),
-			OldStatus: string(oldStatus),
-			NewStatus: string(booking.Status()),
-			UpdatedAt: time.Now(),
-			Reason:    "Booking confirmed by system",
-		}
-
-		payload, txErr := json.Marshal(event)
-		if txErr != nil {
-			return fmt.Errorf("сериализация события для outbox: %w", txErr)
-		}
-
-		outboxMsg := &models.OutboxMessage{
-			EventID:     event.EventId,
-			EventType:   "BookingStatusChangedEvent",
-			Payload:     payload,
-			Status:      "pending",
-			Attempts:    0,
-			MaxAttempts: 3,
-			CreatedAt:   time.Now(),
-		}
-
-		if txErr := s.repo.SaveOutboxMessage(txCtx, outboxMsg); txErr != nil {
-			return fmt.Errorf("сохранение события в outbox: %w", txErr)
-		}
-
-		return nil
-	})
-
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("начало транзакции: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.repo.UpdateTx(ctx, tx, booking); err != nil {
+		return fmt.Errorf("обновление бронирования: %w", err)
 	}
 
-	s.logger.Info("бронирование успешно подтверждено, событие сохранено в outbox", zap.Int64("id", id))
+	reason := "Booking job confirmed by Catalog Service"
+	if err := s.historyRepo.AddTx(ctx, tx, models.BookingHistoryEntry{
+		BookingID:   id,
+		OldStatus:   &oldStatus,
+		NewStatus:   booking.Status(),
+		ChangedAt:   time.Now(),
+		Reason:      &reason,
+		InitiatedBy: initiatedBy,
+	}); err != nil {
+		return fmt.Errorf("запись истории: %w", err)
+	}
+
+	if eventID != "" {
+		if err := s.markProcessedTx(ctx, tx, eventID); err != nil {
+			return err
+		}
+	}
+
+	if s.outboxSaver != nil {
+		if err := s.outboxSaver.SaveTx(ctx, tx, messaging.BookingStatusChangedEvent{
+			EventId:   messaging.NewMessageID(),
+			BookingId: id,
+			OldStatus: string(oldStatus),
+			NewStatus: string(booking.Status()),
+			ChangedAt: time.Now().UTC(),
+			Reason:    "Booking job confirmed by Catalog Service",
+		}); err != nil {
+			return fmt.Errorf("сохранение события в outbox: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("коммит транзакции: %w", err)
+	}
+
+	s.logger.Info("бронирование подтверждено", zap.Int64("id", id))
+
 	return nil
 }
 
-// HandleCancelError откатывает отмену при сбоях в других сервисах (DLQ)
-func (s *BookingsService) HandleCancelError(ctx context.Context, requestID string) error {
-	bookingID, err := messaging.RequestIDToBookingID(requestID)
-	if err != nil {
-		s.logger.Error("критическая ошибка: не удалось распарсить requestID в DLQ", zap.String("requestId", requestID), zap.Error(err))
-		return nil
-	}
-
-	booking, err := s.repo.GetByID(ctx, bookingID)
-	if err != nil {
-		if errors.Is(err, models.ErrBookingNotFound) {
-			s.logger.Warn("бронирование для отката не найдено в БД, пропускаем сообщение", zap.Int64("id", bookingID))
+// HandleCancelError выполняет rollback отмены при ошибке (DLQ handler).
+// eventID используется для идемпотентности: повторное событие игнорируется.
+func (s *BookingsService) HandleCancelError(ctx context.Context, id int64, eventID string) error {
+	if eventID != "" {
+		if dup, err := s.isDuplicate(ctx, eventID); err != nil {
+			return err
+		} else if dup {
 			return nil
 		}
-		return fmt.Errorf("получение бронирования из БД id=%d: %w", bookingID, err)
+	}
+	return s.handleCancelErrorWithInitiator(ctx, id, "System", eventID)
+}
+
+// handleCancelErrorWithInitiator — внутренняя реализация rollback.
+func (s *BookingsService) handleCancelErrorWithInitiator(ctx context.Context, id int64, initiatedBy, eventID string) error {
+	booking, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, models.ErrBookingNotFound) {
+			s.logger.Warn("бронирование не найдено при откате отмены", zap.Int64("id", id))
+			return nil
+		}
+		return err
 	}
 
 	oldStatus := booking.Status()
 
 	if err := booking.RollbackCancellation(); err != nil {
-		return err
+		return fmt.Errorf("откат отмены бронирования %d: %w", id, err)
 	}
 
-	err = s.repo.WithTx(ctx, func(txCtx context.Context) error {
-		if txErr := s.repo.Update(txCtx, booking); txErr != nil {
-			return fmt.Errorf("откат отмены бронирования в БД id=%d: %w", bookingID, txErr)
-		}
-
-		log := models.NewBookingAuditLog(
-			booking.ID(),
-			oldStatus,
-			booking.Status(),
-			"System",
-			"Rollback cancellation due to external processing failure",
-		)
-
-		if txErr := s.repo.SaveAuditLog(txCtx, log); txErr != nil {
-			return fmt.Errorf("сохранение лога аудита отката отмены: %w", txErr)
-		}
-
-		event := messaging.BookingStatusChangedEvent{
-			EventId:   messaging.NewMessageID(),
-			BookingId: booking.ID(),
-			OldStatus: string(oldStatus),
-			NewStatus: string(booking.Status()),
-			UpdatedAt: time.Now(),
-			Reason:    "Rollback cancellation due to external processing failure",
-		}
-
-		payload, txErr := json.Marshal(event)
-		if txErr != nil {
-			return fmt.Errorf("сериализация события для outbox: %w", txErr)
-		}
-
-		outboxMsg := &models.OutboxMessage{
-			EventID:     event.EventId,
-			EventType:   "BookingStatusChangedEvent",
-			Payload:     payload,
-			Status:      "pending",
-			Attempts:    0,
-			MaxAttempts: 3,
-			CreatedAt:   time.Now(),
-		}
-
-		if txErr := s.repo.SaveOutboxMessage(txCtx, outboxMsg); txErr != nil {
-			return fmt.Errorf("сохранение события в outbox: %w", txErr)
-		}
-
-		return nil
-	})
-
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("начало транзакции: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.repo.UpdateTx(ctx, tx, booking); err != nil {
+		return fmt.Errorf("обновление бронирования при откате: %w", err)
 	}
 
-	s.logger.Info("отмена бронирования откатана назад, событие сохранено в outbox", zap.Int64("id", bookingID))
+	reason := "Cancellation rolled back: DLQ error"
+	if err := s.historyRepo.AddTx(ctx, tx, models.BookingHistoryEntry{
+		BookingID:   id,
+		OldStatus:   &oldStatus,
+		NewStatus:   booking.Status(),
+		ChangedAt:   time.Now(),
+		Reason:      &reason,
+		InitiatedBy: initiatedBy,
+	}); err != nil {
+		return fmt.Errorf("запись истории: %w", err)
+	}
+
+	if eventID != "" {
+		if err := s.markProcessedTx(ctx, tx, eventID); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("коммит транзакции: %w", err)
+	}
+
+	s.logger.Info("отмена не удалась, статус возвращён",
+		zap.Int64("id", id),
+		zap.String("status", string(booking.Status())),
+	)
 	return nil
 }
+
+// isDuplicate проверяет, обрабатывалось ли событие ранее.
+// Возвращает (true, nil) если дубликат — обработчик должен вернуть nil.
+func (s *BookingsService) isDuplicate(ctx context.Context, eventID string) (bool, error) {
+	processed, err := s.processedEventRepo.IsProcessed(ctx, eventID)
+	if err != nil {
+		return false, fmt.Errorf("проверка идемпотентности: %w", err)
+	}
+	if processed {
+		s.logger.Warn("дубликат события проигнорирован", zap.String("eventId", eventID))
+		return true, nil
+	}
+	return false, nil
+}
+
+// markProcessedTx записывает eventID в рамках транзакции.
+// Конфликт UNIQUE (код 23505) означает, что параллельный instance уже обработал событие — не ошибка.
+func (s *BookingsService) markProcessedTx(ctx context.Context, tx pgx.Tx, eventID string) error {
+	err := s.processedEventRepo.MarkProcessedTx(ctx, tx, eventID)
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		s.logger.Warn("duplicate event on concurrent processing, ignoring", zap.String("eventId", eventID))
+		return nil
+	}
+	return fmt.Errorf("запись идемпотентности: %w", err)
+}
+

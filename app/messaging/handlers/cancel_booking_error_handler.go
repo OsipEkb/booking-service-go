@@ -8,56 +8,42 @@ import (
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
-	"booking-service/app/models"
 	"booking-service/app/service"
 )
 
+// CancelBookingErrorHandler обрабатывает сообщения из DLQ при ошибке отмены бронирования.
 type CancelBookingErrorHandler struct {
 	service *service.BookingsService
-	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
-func NewCancelBookingErrorHandler(svc *service.BookingsService, repo models.BookingRepository, logger *zap.Logger) *CancelBookingErrorHandler {
+// NewCancelBookingErrorHandler создаёт новый обработчик.
+func NewCancelBookingErrorHandler(svc *service.BookingsService, logger *zap.Logger) *CancelBookingErrorHandler {
 	return &CancelBookingErrorHandler{
 		service: svc,
-		repo:    repo,
 		logger:  logger,
 	}
 }
 
+// Handle обрабатывает сообщение об ошибке отмены и выполняет rollback.
 func (h *CancelBookingErrorHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.CancelBookingJobCommand
 	if err := json.Unmarshal(body, &event); err != nil {
 		return fmt.Errorf("десериализация CancelBookingJobCommand: %w", err)
 	}
 
-	h.logger.Info("получена ошибка отмены бронирования, запускаем откат",
-		zap.String("requestId", event.RequestId),
-		zap.String("eventId", event.EventId),
-	)
-
-	err := h.repo.WithTx(ctx, func(txCtx context.Context) error {
-		isNew, err := h.repo.RegisterEvent(txCtx, event.EventId, "CancelBookingError")
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			h.logger.Warn("событие ошибки отмены уже обработано (дубликат), пропускаем", zap.String("eventId", event.EventId))
-			return nil
-		}
-
-		if err := h.service.HandleCancelError(txCtx, event.RequestId); err != nil {
-			return fmt.Errorf("ошибка при выполнении отката для requestId=%s: %w", event.RequestId, err)
-		}
-
-		return nil
-	})
-
+	bookingID, err := messaging.RequestIDToBookingID(event.RequestId)
 	if err != nil {
-		return fmt.Errorf("ошибка транзакции в CancelBookingErrorHandler: %w", err)
+		return fmt.Errorf("извлечение bookingId из RequestId: %w", err)
 	}
 
-	h.logger.Info("откат статуса бронирования успешно завершен", zap.String("requestId", event.RequestId))
+	h.logger.Info("получено сообщение об ошибке отмены бронирования из DLQ",
+		zap.Int64("bookingId", bookingID),
+	)
+
+	if err := h.service.HandleCancelError(ctx, bookingID, event.EventId); err != nil {
+		return fmt.Errorf("откат отмены бронирования %d: %w", bookingID, err)
+	}
+
 	return nil
 }

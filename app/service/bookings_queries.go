@@ -11,23 +11,18 @@ import (
 	"booking-service/app/models"
 )
 
-var (
-	ErrInvalidDateFormat = fmt.Errorf("некорректный формат даты")
-	ErrInvalidDateRange  = fmt.Errorf("dateTo не может быть раньше dateFrom")
-)
-
 // BookingsQueries обрабатывает запросы (чтение данных) для бронирований.
 type BookingsQueries struct {
 	repo        models.BookingRepository
-	queriesRepo models.BookingQueriesRepository
+	historyRepo models.BookingHistoryRepository
 	logger      *zap.Logger
 }
 
 // NewBookingsQueries создаёт новый BookingsQueries.
-func NewBookingsQueries(repo models.BookingRepository, queriesRepo models.BookingQueriesRepository, logger *zap.Logger) *BookingsQueries {
+func NewBookingsQueries(repo models.BookingRepository, historyRepo models.BookingHistoryRepository, logger *zap.Logger) *BookingsQueries {
 	return &BookingsQueries{
 		repo:        repo,
-		queriesRepo: queriesRepo,
+		historyRepo: historyRepo,
 		logger:      logger,
 	}
 }
@@ -77,7 +72,7 @@ func (q *BookingsQueries) GetByFilter(ctx context.Context, req dto.GetBookingsBy
 
 	bookings, totalCount, err := q.repo.GetByFilter(ctx, filter)
 	if err != nil {
-		return dto.PagedResponse[dto.BookingResponse]{}, fmt.Errorf("получение бронирования: %w", err)
+		return dto.PagedResponse[dto.BookingResponse]{}, fmt.Errorf("получение бронирований: %w", err)
 	}
 
 	items := make([]dto.BookingResponse, 0, len(bookings))
@@ -93,7 +88,72 @@ func (q *BookingsQueries) GetByFilter(ctx context.Context, req dto.GetBookingsBy
 	}, nil
 }
 
-// mapBookingToResponse конвертирует доменный объект в DTO ответа..
+// GetStatistics возвращает агрегированную статистику бронирований за период.
+func (q *BookingsQueries) GetStatistics(ctx context.Context, dateFrom, dateTo time.Time) (dto.BookingStatisticsResponse, error) {
+	stats, err := q.repo.GetStatistics(ctx, dateFrom, dateTo)
+	if err != nil {
+		return dto.BookingStatisticsResponse{}, fmt.Errorf("получение статистики: %w", err)
+	}
+
+	response := dto.BookingStatisticsResponse{
+		TotalBookings: stats.TotalBookings,
+		ByStatus: dto.BookingStatusStats{
+			AwaitConfirmation:   stats.ByStatus[models.BookingStatusAwaitsConfirmation],
+			Confirmed:           stats.ByStatus[models.BookingStatusConfirmed],
+			Cancelled:           stats.ByStatus[models.BookingStatusCancelled],
+			CancellationPending: stats.ByStatus[models.BookingStatusCancellationPending],
+		},
+		TopResources: make([]dto.ResourceBookingCount, 0, len(stats.TopResources)),
+	}
+
+	for _, r := range stats.TopResources {
+		response.TopResources = append(response.TopResources, dto.ResourceBookingCount{
+			ResourceID:    r.ResourceID,
+			BookingsCount: r.BookingsCount,
+		})
+	}
+
+	return response, nil
+}
+
+// GetHistory возвращает историю изменений бронирования с пагинацией.
+func (q *BookingsQueries) GetHistory(ctx context.Context, bookingID int64, page, pageSize int) (dto.BookingHistoryResponse, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+
+	entries, total, err := q.historyRepo.GetByBookingID(ctx, bookingID, page, pageSize)
+	if err != nil {
+		return dto.BookingHistoryResponse{}, fmt.Errorf("получение истории бронирования: %w", err)
+	}
+
+	items := make([]dto.BookingHistoryItem, 0, len(entries))
+	for _, e := range entries {
+		item := dto.BookingHistoryItem{
+			ID:          e.ID,
+			NewStatus:   string(e.NewStatus),
+			ChangedAt:   e.ChangedAt.Format("2006-01-02T15:04:05Z07:00"),
+			Reason:      e.Reason,
+			InitiatedBy: e.InitiatedBy,
+		}
+		if e.OldStatus != nil {
+			s := string(*e.OldStatus)
+			item.OldStatus = &s
+		}
+		items = append(items, item)
+	}
+
+	return dto.BookingHistoryResponse{
+		BookingID:  bookingID,
+		TotalCount: total,
+		Items:      items,
+	}, nil
+}
+
+// mapBookingToResponse конвертирует доменный объект в DTO ответа.
 func mapBookingToResponse(b *models.Booking) dto.BookingResponse {
 	return dto.BookingResponse{
 		ID:         b.ID(),
@@ -104,83 +164,4 @@ func mapBookingToResponse(b *models.Booking) dto.BookingResponse {
 		EndDate:    b.EndDate().Format(dto.DateFormat),
 		CreatedAt:  b.CreatedAt().Format("2006-01-02T15:04:05Z07:00"),
 	}
-}
-
-func (q *BookingsQueries) GetStatistics(ctx context.Context, req dto.BookingStatisticsRequest) (dto.BookingStatisticsResponse, error) {
-	if q.queriesRepo == nil {
-		return dto.BookingStatisticsResponse{}, fmt.Errorf("аналитический репозиторий не инициализирован")
-	}
-
-	dateFrom, err := time.Parse(dto.DateFormat, req.DateFrom)
-	if err != nil {
-		return dto.BookingStatisticsResponse{}, fmt.Errorf("%w: некорректный формат dateFrom", ErrInvalidDateFormat)
-	}
-
-	dateTo, err := time.Parse(dto.DateFormat, req.DateTo)
-	if err != nil {
-		return dto.BookingStatisticsResponse{}, fmt.Errorf("%w: некорректный формат dateTo", ErrInvalidDateFormat)
-	}
-
-	dateTo = dateTo.Add(24*time.Hour - time.Nanosecond)
-
-	if dateTo.Before(dateFrom) {
-		return dto.BookingStatisticsResponse{}, ErrInvalidDateRange
-	}
-
-	stats, err := q.queriesRepo.GetStatistics(ctx, dateFrom, dateTo)
-	if err != nil {
-		return dto.BookingStatisticsResponse{}, fmt.Errorf("сервис статистики: %w", err)
-	}
-
-	statusCounts := map[string]int64{
-		string(models.BookingStatusAwaitsConfirmation):  0,
-		string(models.BookingStatusConfirmed):           0,
-		string(models.BookingStatusCancelled):           0,
-		string(models.BookingStatusCancellationPending): 0,
-	}
-
-	for status, count := range stats.StatusCounts {
-		statusCounts[string(status)] = count
-	}
-
-	topResources := make([]dto.TopResourceDTO, 0, len(stats.TopResources))
-	for _, res := range stats.TopResources {
-		topResources = append(topResources, dto.TopResourceDTO{
-			ResourceID:   res.ResourceID,
-			BookingCount: res.BookingCount,
-		})
-	}
-
-	return dto.BookingStatisticsResponse{
-		TotalCount:   stats.TotalCount,
-		StatusCounts: statusCounts,
-		TopResources: topResources,
-	}, nil
-}
-
-func (q *BookingsQueries) GetAuditLogs(ctx context.Context, bookingID int64, page, size int) (dto.PagedResponse[dto.BookingAuditLogResponse], error) {
-	domainLogs, totalCount, err := q.repo.GetAuditLogsByBookingID(ctx, bookingID, page, size)
-	if err != nil {
-		return dto.PagedResponse[dto.BookingAuditLogResponse]{}, fmt.Errorf("получение истории аудита из БД: %w", err)
-	}
-
-	items := make([]dto.BookingAuditLogResponse, 0, len(domainLogs))
-	for _, log := range domainLogs {
-		items = append(items, dto.BookingAuditLogResponse{
-			ID:         log.ID(),
-			BookingID:  log.BookingID(),
-			FromStatus: string(log.FromStatus()),
-			ToStatus:   string(log.ToStatus()),
-			ChangedAt:  log.ChangedAt().Format("2006-01-02T15:04:05Z07:00"),
-			Initiator:  log.Initiator(),
-			Reason:     log.Reason(),
-		})
-	}
-
-	return dto.PagedResponse[dto.BookingAuditLogResponse]{
-		Items:      items,
-		TotalCount: totalCount,
-		Page:       page,
-		Size:       size,
-	}, nil
 }

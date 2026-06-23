@@ -68,7 +68,7 @@ services:
     ports:
       - "8081:8080"
     env_file:
-      - compose.dev.env
+      - ./compose.dev.env
     depends_on:
       booking-db:
         condition: service_started

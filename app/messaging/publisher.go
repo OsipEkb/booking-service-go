@@ -12,21 +12,24 @@ import (
 
 // Publisher публикует сообщения в RabbitMQ.
 type Publisher struct {
-	conn                  *Connection
-	exchangeName          string
-	publisherExchangeName string
-	logger                *zap.Logger
+	conn                   *Connection
+	exchangeName           string
+	publisherExchangeName  string
+	domainEventsExchangeName string
+	logger                 *zap.Logger
 }
 
 // NewPublisher создаёт новый Publisher.
 // exchangeName — exchange для получения ответов (consumer side).
 // publisherExchangeName — exchange для отправки команд в Catalog.
-func NewPublisher(conn *Connection, exchangeName, publisherExchangeName string, logger *zap.Logger) *Publisher {
+// domainEventsExchangeName — exchange для публикации доменных событий.
+func NewPublisher(conn *Connection, exchangeName, publisherExchangeName, domainEventsExchangeName string, logger *zap.Logger) *Publisher {
 	return &Publisher{
-		conn:                  conn,
-		exchangeName:          exchangeName,
-		publisherExchangeName: publisherExchangeName,
-		logger:                logger,
+		conn:                     conn,
+		exchangeName:             exchangeName,
+		publisherExchangeName:    publisherExchangeName,
+		domainEventsExchangeName: domainEventsExchangeName,
+		logger:                   logger,
 	}
 }
 
@@ -71,6 +74,39 @@ func (p *Publisher) PublishCancelBookingJob(ctx context.Context, cmd CancelBooki
 	return p.publishToCatalog(ctx, RoutingKeyCancelBookingJob, cmd)
 }
 
+// PublishBookingStatusChanged публикует событие изменения статуса бронирования.
+func (p *Publisher) PublishBookingStatusChanged(ctx context.Context, event BookingStatusChangedEvent) error {
+	body, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("сериализация события: %w", err)
+	}
+
+	err = p.conn.Channel().PublishWithContext(
+		ctx,
+		p.domainEventsExchangeName,
+		RoutingKeyBookingStatusChanged,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("публикация BookingStatusChangedEvent: %w", err)
+	}
+
+	p.logger.Info("BookingStatusChangedEvent опубликован",
+		zap.String("eventId", event.EventId),
+		zap.Int64("bookingId", event.BookingId),
+		zap.String("oldStatus", event.OldStatus),
+		zap.String("newStatus", event.NewStatus),
+	)
+
+	return nil
+}
+
 // publishToCatalog публикует сообщение в Catalog через Rebus-совместимый exchange.
 // Добавляет заголовки, необходимые для Rebus (rbs2-*).
 func (p *Publisher) publishToCatalog(ctx context.Context, routingKey string, message any) error {
@@ -109,37 +145,6 @@ func (p *Publisher) publishToCatalog(ctx context.Context, routingKey string, mes
 	p.logger.Debug("сообщение опубликовано в Catalog",
 		zap.String("routingKey", routingKey),
 		zap.String("exchange", p.publisherExchangeName),
-		zap.String("body", string(body)),
-	)
-
-	return nil
-}
-
-func (p *Publisher) PublishBookingStatusChanged(ctx context.Context, event BookingStatusChangedEvent) error {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("сериализация BookingStatusChangedEvent: %w", err)
-	}
-
-	err = p.conn.Channel().PublishWithContext(
-		ctx,
-		"booking-domain-events",
-		RoutingKeyBookingStatusChanged,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			Body:         body,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("публикация доменного события (bookingId: %d): %w", event.BookingId, err)
-	}
-
-	p.logger.Debug("доменное событие изменения статуса опубликовано",
-		zap.Int64("bookingId", event.BookingId),
-		zap.String("routingKey", RoutingKeyBookingStatusChanged),
 		zap.String("body", string(body)),
 	)
 

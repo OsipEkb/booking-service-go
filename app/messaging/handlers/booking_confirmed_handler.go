@@ -8,26 +8,24 @@ import (
 	"go.uber.org/zap"
 
 	"booking-service/app/messaging"
-	"booking-service/app/models"
 	"booking-service/app/service"
 )
 
+// BookingConfirmedHandler обрабатывает события BookingJobConfirmed.
 type BookingConfirmedHandler struct {
 	service *service.BookingsService
-	queries *service.BookingsQueries
-	repo    models.BookingRepository
 	logger  *zap.Logger
 }
 
-func NewBookingConfirmedHandler(svc *service.BookingsService, queries *service.BookingsQueries, repo models.BookingRepository, logger *zap.Logger) *BookingConfirmedHandler {
+// NewBookingConfirmedHandler создаёт новый обработчик.
+func NewBookingConfirmedHandler(svc *service.BookingsService, logger *zap.Logger) *BookingConfirmedHandler {
 	return &BookingConfirmedHandler{
 		service: svc,
-		queries: queries,
-		repo:    repo,
 		logger:  logger,
 	}
 }
 
+// Handle обрабатывает событие подтверждения бронирования.
 func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error {
 	var event messaging.BookingJobConfirmed
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -41,30 +39,11 @@ func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error
 
 	h.logger.Info("получено событие BookingJobConfirmed",
 		zap.Int64("bookingId", bookingID),
-		zap.String("eventId", event.EventId),
+		zap.Int64("catalogJobId", event.Id),
 	)
 
-	eventIDStr := event.EventId
-
-	err = h.repo.WithTx(ctx, func(txCtx context.Context) error {
-		isNew, err := h.repo.RegisterEvent(txCtx, eventIDStr, "BookingConfirmed")
-		if err != nil {
-			return err
-		}
-		if !isNew {
-			h.logger.Warn("событие уже обработано (дубликат), пропускаем", zap.String("eventId", eventIDStr))
-			return nil
-		}
-
-		if err := h.service.Confirm(txCtx, bookingID); err != nil {
-			return fmt.Errorf("подтверждение бронирования %d: %w", bookingID, err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("ошибка транзакции обработки события: %w", err)
+	if err := h.service.Confirm(ctx, bookingID, event.EventId); err != nil {
+		return fmt.Errorf("подтверждение бронирования %d: %w", bookingID, err)
 	}
 
 	h.logger.Info("бронирование подтверждено через событие", zap.Int64("bookingId", bookingID))

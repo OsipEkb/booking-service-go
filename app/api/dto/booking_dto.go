@@ -54,30 +54,42 @@ type ProblemDetails struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-type TopResourceDTO struct {
-	ResourceID   int64 `json:"resourceId"`
-	BookingCount int64 `json:"bookingCount"`
-}
-
+// BookingStatisticsResponse -- ответ с агрегированной статистикой бронирований.
 type BookingStatisticsResponse struct {
-	TotalCount   int64            `json:"totalCount"`
-	StatusCounts map[string]int64 `json:"statusCounts"`
-	TopResources []TopResourceDTO `json:"topResources"`
+	TotalBookings int64               `json:"totalBookings"`
+	ByStatus      BookingStatusStats  `json:"byStatus"`
+	TopResources  []ResourceBookingCount `json:"topResources"`
 }
 
-type BookingStatisticsRequest struct {
-	DateFrom string
-	DateTo   string
+// BookingStatusStats -- разбивка количества бронирований по статусам.
+type BookingStatusStats struct {
+	AwaitConfirmation   int64 `json:"awaitConfirmation"`
+	Confirmed           int64 `json:"confirmed"`
+	Cancelled           int64 `json:"cancelled"`
+	CancellationPending int64 `json:"cancellationPending"`
 }
 
-type BookingAuditLogResponse struct {
-	ID         int64  `json:"id"`
-	BookingID  int64  `json:"bookingId"`
-	FromStatus string `json:"fromStatus"`
-	ToStatus   string `json:"toStatus"`
-	ChangedAt  string `json:"changedAt"`
-	Initiator  string `json:"initiator"`
-	Reason     string `json:"reason"`
+// ResourceBookingCount -- количество бронирований для одного ресурса.
+type ResourceBookingCount struct {
+	ResourceID    int64 `json:"resourceId"`
+	BookingsCount int64 `json:"bookingsCount"`
+}
+
+// BookingHistoryResponse — ответ с историей изменений бронирования.
+type BookingHistoryResponse struct {
+	BookingID  int64                `json:"bookingId"`
+	TotalCount int64                `json:"totalCount"`
+	Items      []BookingHistoryItem `json:"items"`
+}
+
+// BookingHistoryItem — одна запись в истории изменений.
+type BookingHistoryItem struct {
+	ID          int64   `json:"id"`
+	OldStatus   *string `json:"oldStatus"`
+	NewStatus   string  `json:"newStatus"`
+	ChangedAt   string  `json:"changedAt"`
+	Reason      *string `json:"reason"`
+	InitiatedBy string  `json:"initiatedBy"`
 }
 
 // DateFormat -- формат даты для JSON-сериализации.

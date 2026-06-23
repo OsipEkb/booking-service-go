@@ -1,8 +1,6 @@
 package models
 
-import (
-	"time"
-)
+import "time"
 
 // BookingStatus представляет статус бронирования.
 type BookingStatus string
@@ -27,26 +25,26 @@ func (s BookingStatus) IsValid() bool {
 // Booking -- доменная сущность бронирования.
 // Поля неэкспортируемые для обеспечения инкапсуляции.
 type Booking struct {
-	id         int64
-	status     BookingStatus
-	userID     int64
-	resourceID int64
-	startDate  time.Time
-	endDate    time.Time
-	createdAt  time.Time
-	canceledAt *time.Time
-	prevStatus BookingStatus
+	id                 int64
+	status             BookingStatus
+	userID             int64
+	resourceID         int64
+	startDate          time.Time
+	endDate            time.Time
+	createdAt          time.Time
+	previousStatus     BookingStatus
+	cancellationSentAt *time.Time
 }
 
-func (b *Booking) ID() int64                 { return b.id }
-func (b *Booking) Status() BookingStatus     { return b.status }
-func (b *Booking) UserID() int64             { return b.userID }
-func (b *Booking) ResourceID() int64         { return b.resourceID }
-func (b *Booking) StartDate() time.Time      { return b.startDate }
-func (b *Booking) EndDate() time.Time        { return b.endDate }
-func (b *Booking) CreatedAt() time.Time      { return b.createdAt }
-func (b *Booking) CanceledAt() *time.Time    { return b.canceledAt }
-func (b *Booking) PrevStatus() BookingStatus { return b.prevStatus }
+func (b *Booking) ID() int64                      { return b.id }
+func (b *Booking) Status() BookingStatus          { return b.status }
+func (b *Booking) UserID() int64                  { return b.userID }
+func (b *Booking) ResourceID() int64              { return b.resourceID }
+func (b *Booking) StartDate() time.Time           { return b.startDate }
+func (b *Booking) EndDate() time.Time             { return b.endDate }
+func (b *Booking) CreatedAt() time.Time           { return b.createdAt }
+func (b *Booking) PreviousStatus() BookingStatus  { return b.previousStatus }
+func (b *Booking) CancellationSentAt() *time.Time { return b.cancellationSentAt }
 
 // NewBooking создаёт новое бронирование в статусе AwaitsConfirmation.
 func NewBooking(userID, resourceID int64, startDate, endDate time.Time) (*Booking, error) {
@@ -70,24 +68,23 @@ func NewBooking(userID, resourceID int64, startDate, endDate time.Time) (*Bookin
 		startDate:  startDate,
 		endDate:    endDate,
 		createdAt:  time.Now(),
-		canceledAt: nil,
 	}, nil
 }
 
 // Confirm подтверждает бронирование.
-// Допустимый переход: AwaitsConfirmation -> Confirmed.
+// Допустимые переходы:
+//   - AwaitsConfirmation -> Confirmed
+//   - CancellationPending -> Confirmed (race condition: Catalog успел подтвердить до обработки отмены)
 func (b *Booking) Confirm() error {
 	switch b.status {
 	case BookingStatusAwaitsConfirmation:
 		b.status = BookingStatusConfirmed
 		return nil
-
 	case BookingStatusCancellationPending:
 		b.status = BookingStatusConfirmed
-		b.prevStatus = ""
-		b.canceledAt = nil
+		b.previousStatus = ""
+		b.cancellationSentAt = nil
 		return nil
-
 	default:
 		return ErrInvalidStatusTransition
 	}
@@ -115,67 +112,66 @@ func (b *Booking) Cancel(today time.Time) error {
 	}
 }
 
-// RestoreBooking восстанавливает Booking из данных хранилища.
-// Используется только в слое storage для маппинга строк БД на доменный объект.
-func RestoreBooking(
-	id int64,
-	status, prevStatus BookingStatus,
-	userID, resourceID int64,
-	startDate, endDate, createdAt time.Time,
-	canceledAt *time.Time,
-) *Booking {
-	return &Booking{
-		id:         id,
-		status:     status,
-		userID:     userID,
-		resourceID: resourceID,
-		startDate:  startDate,
-		endDate:    endDate,
-		createdAt:  createdAt,
-		prevStatus: prevStatus,
-		canceledAt: canceledAt,
-	}
-}
-
-func (b *Booking) StartCancellation(today time.Time) error {
+// StartCancellation начинает процесс отмены.
+// Допустимые переходы: AwaitsConfirmation/Confirmed -> CancellationPending.
+func (b *Booking) StartCancellation(sentAt time.Time) error {
 	switch b.status {
-	case BookingStatusAwaitsConfirmation:
-		b.prevStatus = b.status
+	case BookingStatusAwaitsConfirmation, BookingStatusConfirmed:
+		b.previousStatus = b.status
 		b.status = BookingStatusCancellationPending
-		b.canceledAt = &today
-		return nil
-	case BookingStatusConfirmed:
-		if !b.startDate.After(today) {
-			return ErrCannotCancelPastBooking
-		}
-		b.prevStatus = b.status
-		b.status = BookingStatusCancellationPending
-		b.canceledAt = &today
+		b.cancellationSentAt = &sentAt
 		return nil
 	default:
 		return ErrInvalidStatusTransition
 	}
 }
 
-func (b *Booking) ConfirmCancellation() error {
+// CompleteCancellation завершает отмену успешно.
+// Допустимый переход: CancellationPending -> Cancelled.
+func (b *Booking) CompleteCancellation() error {
 	if b.status != BookingStatusCancellationPending {
 		return ErrInvalidStatusTransition
 	}
 	b.status = BookingStatusCancelled
+	b.previousStatus = ""
+	b.cancellationSentAt = nil
 	return nil
 }
 
+// RollbackCancellation откатывает отмену при ошибке.
+// Допустимый переход: CancellationPending -> previousStatus.
 func (b *Booking) RollbackCancellation() error {
-	switch b.status {
-	case BookingStatusCancellationPending:
-		if b.prevStatus == "" {
-			return ErrInvalidStatusTransition
-		}
-		b.status = b.prevStatus
-		b.prevStatus = ""
-		b.canceledAt = nil
-		return nil
-	default:
+	if b.status != BookingStatusCancellationPending {
 		return ErrInvalidStatusTransition
+	}
+	if b.previousStatus == "" {
+		return ErrInvalidStatusTransition
+	}
+	b.status = b.previousStatus
+	b.previousStatus = ""
+	b.cancellationSentAt = nil
+	return nil
+}
+
+// RestoreBooking восстанавливает Booking из данных хранилища.
+// Используется только в слое storage для маппинга строк БД на доменный объект.
+func RestoreBooking(
+	id int64,
+	status BookingStatus,
+	userID, resourceID int64,
+	startDate, endDate, createdAt time.Time,
+	previousStatus BookingStatus,
+	cancellationSentAt *time.Time,
+) *Booking {
+	return &Booking{
+		id:                 id,
+		status:             status,
+		userID:             userID,
+		resourceID:         resourceID,
+		startDate:          startDate,
+		endDate:            endDate,
+		createdAt:          createdAt,
+		previousStatus:     previousStatus,
+		cancellationSentAt: cancellationSentAt,
 	}
 }

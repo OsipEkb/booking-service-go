@@ -11,38 +11,41 @@ import (
 	"booking-service/app/models"
 )
 
+// OutboxWorker читает неотправленные сообщения из outbox и доставляет их в RabbitMQ.
 type OutboxWorker struct {
-	repo        models.BookingRepository
-	publisher   *messaging.Publisher
-	interval    time.Duration
-	batchSize   int
-	maxAttempts int
-	logger      *zap.Logger
+	repo      models.OutboxRepository
+	publisher *messaging.Publisher
+	interval  time.Duration
+	maxRetry  int
+	batchSize int
+	logger    *zap.Logger
 }
 
+// NewOutboxWorker создаёт новый OutboxWorker.
 func NewOutboxWorker(
-	repo models.BookingRepository,
+	repo models.OutboxRepository,
 	publisher *messaging.Publisher,
 	interval time.Duration,
+	maxRetry int,
 	batchSize int,
-	maxAttempts int,
 	logger *zap.Logger,
 ) *OutboxWorker {
 	return &OutboxWorker{
-		repo:        repo,
-		publisher:   publisher,
-		interval:    interval,
-		batchSize:   batchSize,
-		maxAttempts: maxAttempts,
-		logger:      logger,
+		repo:      repo,
+		publisher: publisher,
+		interval:  interval,
+		maxRetry:  maxRetry,
+		batchSize: batchSize,
+		logger:    logger,
 	}
 }
 
+// Run запускает воркер. Блокирует до отмены контекста.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	w.logger.Info("Outbox воркер успешно запущен",
+	w.logger.Info("outbox worker запущен",
 		zap.Duration("interval", w.interval),
+		zap.Int("maxRetry", w.maxRetry),
 		zap.Int("batchSize", w.batchSize),
-		zap.Int("maxAttempts", w.maxAttempts),
 	)
 
 	ticker := time.NewTicker(w.interval)
@@ -51,7 +54,7 @@ func (w *OutboxWorker) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			w.logger.Info("Outbox воркер остановлен")
+			w.logger.Info("outbox worker остановлен")
 			return
 		case <-ticker.C:
 			w.processBatch(ctx)
@@ -60,64 +63,40 @@ func (w *OutboxWorker) Run(ctx context.Context) {
 }
 
 func (w *OutboxWorker) processBatch(ctx context.Context) {
-	messages, err := w.repo.GetPendingOutboxMessages(ctx, w.batchSize)
+	messages, err := w.repo.GetPending(ctx, w.maxRetry, w.batchSize)
 	if err != nil {
-		w.logger.Error("ошибка получения сообщений из outbox", zap.Error(err))
+		w.logger.Error("outbox: ошибка получения сообщений", zap.Error(err))
 		return
 	}
-
 	if len(messages) == 0 {
 		return
 	}
 
+	w.logger.Info("outbox: обрабатываем сообщения", zap.Int("count", len(messages)))
+	success, failed := 0, 0
+
 	for _, msg := range messages {
-		w.processMessage(ctx, msg)
-	}
-}
-
-func (w *OutboxWorker) processMessage(ctx context.Context, msg *models.OutboxMessage) {
-	logger := w.logger.With(zap.Int64("outboxId", msg.ID), zap.String("eventId", msg.EventID))
-
-	if msg.EventType != "BookingStatusChangedEvent" {
-		logger.Warn("пропущено неизвестное доменное событие", zap.String("type", msg.EventType))
-		msg.Status = "failed"
-		_ = w.repo.UpdateOutboxMessage(ctx, msg)
-		return
-	}
-
-	var event messaging.BookingStatusChangedEvent
-	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		logger.Error("ошибка десериализации payload события", zap.Error(err))
-		msg.Status = "failed"
-		_ = w.repo.UpdateOutboxMessage(ctx, msg)
-		return
-	}
-
-	msg.Attempts++
-
-	err := w.publisher.PublishBookingStatusChanged(ctx, event)
-	if err != nil {
-		logger.Error("не удалось опубликовать доменное событие из outbox, ретрай", zap.Error(err), zap.Int("attempt", msg.Attempts))
-
-		if msg.Attempts >= w.maxAttempts {
-			logger.Error("достигнут лимит попыток отправки outbox события, помечаем как failed")
-			msg.Status = "failed"
+		var event messaging.BookingStatusChangedEvent
+		if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+			w.logger.Error("outbox: ошибка десериализации", zap.Int64("msgId", msg.ID), zap.Error(err))
+			msg.MarkAsFailed(err.Error())
+			w.repo.Update(ctx, msg) //nolint:errcheck
+			failed++
+			continue
 		}
 
-		if updateErr := w.repo.UpdateOutboxMessage(ctx, msg); updateErr != nil {
-			logger.Error("не удалось обновить статус ошибки в outbox таблице", zap.Error(updateErr))
+		if err := w.publisher.PublishBookingStatusChanged(ctx, event); err != nil {
+			w.logger.Error("outbox: ошибка публикации", zap.Int64("msgId", msg.ID), zap.Error(err))
+			msg.MarkAsFailed(err.Error())
+			w.repo.Update(ctx, msg) //nolint:errcheck
+			failed++
+			continue
 		}
-		return
+
+		msg.MarkAsProcessed()
+		w.repo.Update(ctx, msg) //nolint:errcheck
+		success++
 	}
 
-	now := time.Now()
-	msg.Status = "processed"
-	msg.ProcessedAt = &now
-
-	if updateErr := w.repo.UpdateOutboxMessage(ctx, msg); updateErr != nil {
-		logger.Error("не удалось обновить статус отправленного сообщения в outbox", zap.Error(updateErr))
-		return
-	}
-
-	logger.Info("событие из outbox успешно опубликовано в RabbitMQ")
+	w.logger.Info("outbox: обработано", zap.Int("success", success), zap.Int("failed", failed))
 }

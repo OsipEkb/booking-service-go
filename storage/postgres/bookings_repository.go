@@ -399,3 +399,83 @@ func (r *BookingsRepository) RegisterEvent(ctx context.Context, eventID string, 
 
 	return tag.RowsAffected() > 0, nil
 }
+
+func (r *BookingsRepository) SaveOutboxMessage(ctx context.Context, msg *models.OutboxMessage) error {
+	query := `
+        INSERT INTO outbox_messages (event_id, event_type, payload, status, attempts, max_attempts, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id`
+
+	err := r.getExecutor(ctx).QueryRow(ctx, query,
+		msg.EventID,
+		msg.EventType,
+		msg.Payload,
+		msg.Status,
+		msg.Attempts,
+		msg.MaxAttempts,
+		msg.CreatedAt,
+	).Scan(&msg.ID)
+
+	if err != nil {
+		return fmt.Errorf("вставка сообщения в outbox: %w", err)
+	}
+	return nil
+}
+
+func (r *BookingsRepository) GetPendingOutboxMessages(ctx context.Context, batchSize int) ([]*models.OutboxMessage, error) {
+	query := `
+        SELECT id, event_id, event_type, payload, status, attempts, max_attempts, created_at, processed_at
+        FROM outbox_messages
+        WHERE status = 'pending' AND attempts < max_attempts
+        ORDER BY created_at ASC
+        LIMIT $1`
+
+	rows, err := r.getExecutor(ctx).Query(ctx, query, batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("выборка pending сообщений из outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []*models.OutboxMessage
+	for rows.Next() {
+		var msg models.OutboxMessage
+		err := rows.Scan(
+			&msg.ID,
+			&msg.EventID,
+			&msg.EventType,
+			&msg.Payload,
+			&msg.Status,
+			&msg.Attempts,
+			&msg.MaxAttempts,
+			&msg.CreatedAt,
+			&msg.ProcessedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("сканирование строки outbox: %w", err)
+		}
+		messages = append(messages, &msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("итерация по строкам outbox: %w", err)
+	}
+
+	return messages, nil
+}
+
+func (r *BookingsRepository) UpdateOutboxMessage(ctx context.Context, msg *models.OutboxMessage) error {
+	query := `
+        UPDATE outbox_messages
+        SET status = $1, attempts = $2, processed_at = $3
+        WHERE id = $4`
+
+	tag, err := r.getExecutor(ctx).Exec(ctx, query, msg.Status, msg.Attempts, msg.ProcessedAt, msg.ID)
+	if err != nil {
+		return fmt.Errorf("обновление сообщения outbox id=%d: %w", msg.ID, err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("сообщение outbox id=%d не найдено для обновления", msg.ID)
+	}
+	return nil
+}

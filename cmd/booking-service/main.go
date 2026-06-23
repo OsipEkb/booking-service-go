@@ -134,8 +134,18 @@ func main() {
 		cfg.Worker.ConfirmationBatch,
 		logger,
 	)
-
 	go cancellationWorker.Run(ctx)
+
+	outboxWorker := worker.NewOutboxWorker(
+		repo,
+		publisher,
+		cfg.Worker.OutboxInterval,
+		cfg.Worker.OutboxBatchSize,
+		cfg.Worker.OutboxMaxAttempts,
+		logger,
+	)
+	go outboxWorker.Run(ctx)
+
 	// Consumer
 	consumer := messaging.NewConsumer(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.QueuePrefix, logger)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobConfirmed, messaging.RoutingKeyBookingJobConfirmed, confirmedHandler.Handle)

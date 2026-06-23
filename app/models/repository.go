@@ -27,6 +27,10 @@ type BookingRepository interface {
 	SaveAuditLog(ctx context.Context, log *BookingAuditLog) error
 	GetAuditLogsByBookingID(ctx context.Context, bookingID int64, page int, size int) ([]BookingAuditLog, int64, error)
 	RegisterEvent(ctx context.Context, eventID string, eventType string) (bool, error)
+
+	SaveOutboxMessage(ctx context.Context, msg *OutboxMessage) error
+	GetPendingOutboxMessages(ctx context.Context, batchSize int) ([]*OutboxMessage, error)
+	UpdateOutboxMessage(ctx context.Context, msg *OutboxMessage) error
 }
 
 // BookingFilter содержит параметры фильтрации и пагинации.
@@ -47,6 +51,17 @@ type BookingStatistics struct {
 	TotalCount   int64                   `json:"totalCount"`
 	StatusCounts map[BookingStatus]int64 `json:"statusCounts"`
 	TopResources []TopResource           `json:"topResources"`
+}
+type OutboxMessage struct {
+	ID          int64
+	EventID     string
+	EventType   string
+	Payload     []byte
+	Status      string
+	Attempts    int
+	MaxAttempts int
+	CreatedAt   time.Time
+	ProcessedAt *time.Time
 }
 
 // BookingQueriesRepository — выделенный интерфейс для аналитических выборок (CQRS).

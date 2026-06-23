@@ -20,6 +20,7 @@ import (
 	"booking-service/app/messaging"
 	"booking-service/app/messaging/handlers"
 	"booking-service/app/service"
+	"booking-service/app/worker"
 	pgstore "booking-service/storage/postgres"
 )
 
@@ -48,6 +49,9 @@ func main() {
 	defer pool.Close()
 
 	repo := pgstore.NewBookingsRepository(pool)
+	historyRepo := pgstore.NewBookingHistoryRepository(pool)
+	processedEventRepo := pgstore.NewProcessedEventRepository(pool)
+	outboxRepo := pgstore.NewOutboxRepository(pool)
 
 	// Подключение к RabbitMQ
 	mqConn, err := messaging.NewConnection(
@@ -61,11 +65,26 @@ func main() {
 	}
 	defer mqConn.Close()
 
-	publisher := messaging.NewPublisher(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.PublisherExchangeName, logger)
+	// Объявляем exchange для доменных событий и привязываем очередь
+	if err := mqConn.DeclareExchange(cfg.RabbitMQ.DomainEventsExchange); err != nil {
+		logger.Error("не удалось объявить domain events exchange", zap.Error(err))
+		os.Exit(1)
+	}
+	if _, err := mqConn.DeclareAndBindQueue(
+		cfg.RabbitMQ.DomainEventsExchange+".booking-status-events",
+		cfg.RabbitMQ.DomainEventsExchange,
+		messaging.RoutingKeyBookingStatusChanged,
+	); err != nil {
+		logger.Error("не удалось объявить/привязать очередь booking-status-events", zap.Error(err))
+		os.Exit(1)
+	}
+
+	publisher := messaging.NewPublisher(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.PublisherExchangeName, cfg.RabbitMQ.DomainEventsExchange, logger)
 
 	// Сервисный слой
-	bookingsService := service.NewBookingsService(repo, publisher, logger)
-	bookingsQueries := service.NewBookingsQueries(repo, logger)
+	outboxService := service.NewOutboxService(outboxRepo, logger)
+	bookingsService := service.NewBookingsService(repo, historyRepo, processedEventRepo, publisher, outboxService, logger)
+	bookingsQueries := service.NewBookingsQueries(repo, historyRepo, logger)
 
 	// Catalog-клиент
 	catalogClient := catalog.NewClient(
@@ -80,6 +99,7 @@ func main() {
 	// Хендлеры событий RabbitMQ
 	confirmedHandler := handlers.NewBookingConfirmedHandler(bookingsService, logger)
 	deniedHandler := handlers.NewBookingDeniedHandler(bookingsService, logger)
+	cancelErrorHandler := handlers.NewCancelBookingErrorHandler(bookingsService, logger)
 
 	// Контекст для graceful shutdown фоновых задач
 	ctx, cancel := context.WithCancel(context.Background())
@@ -89,11 +109,42 @@ func main() {
 	consumer := messaging.NewConsumer(mqConn, cfg.RabbitMQ.ExchangeName, cfg.RabbitMQ.QueuePrefix, logger)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobConfirmed, messaging.RoutingKeyBookingJobConfirmed, confirmedHandler.Handle)
 	consumer.Subscribe(messaging.QueueSuffixBookingJobDenied, messaging.RoutingKeyBookingJobDenied, deniedHandler.Handle)
+	consumer.Subscribe(messaging.QueueSuffixCancelBookingJobError, messaging.RoutingKeyCancelBookingJobError, cancelErrorHandler.Handle)
 
 	if err := consumer.Start(ctx); err != nil {
 		logger.Error("не удалось запустить consumer", zap.Error(err))
 		os.Exit(1)
 	}
+
+	// Воркеры
+	confirmationWorker := worker.NewConfirmationWorker(
+		bookingsService,
+		repo,
+		catalogClient,
+		cfg.Worker.ConfirmationInterval,
+		cfg.Worker.ConfirmationBatch,
+		logger,
+	)
+	go confirmationWorker.Run(ctx)
+
+	pendingCancellationsWorker := worker.NewPendingCancellationsWorker(
+		repo,
+		publisher,
+		cfg.Worker.CancellationTimeout,
+		cfg.Worker.CancellationRetryInterval,
+		logger,
+	)
+	go pendingCancellationsWorker.Run(ctx)
+
+	outboxWorker := worker.NewOutboxWorker(
+		outboxRepo,
+		publisher,
+		cfg.Worker.OutboxInterval,
+		cfg.Worker.OutboxMaxRetry,
+		cfg.Worker.OutboxBatchSize,
+		logger,
+	)
+	go outboxWorker.Run(ctx)
 
 	// HTTP-хендлеры и роутер
 	bookingsHandler := handler.NewBookingsHandler(bookingsService, bookingsQueries, logger)

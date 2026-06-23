@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CreateBookingJobCommand -- команда на создание задания в Catalog.
@@ -23,6 +24,17 @@ type CreateBookingJobCommand struct {
 type CancelBookingJobCommand struct {
 	EventId   string `json:"EventId"`
 	RequestId string `json:"RequestId"` // BookingID в формате UUID
+}
+
+// BookingStatusChangedEvent -- событие изменения статуса бронирования.
+// Публикуется при подтверждении, отклонении и отмене бронирования.
+type BookingStatusChangedEvent struct {
+	EventId   string    `json:"EventId"`
+	BookingId int64     `json:"BookingId"`
+	OldStatus string    `json:"OldStatus"`
+	NewStatus string    `json:"NewStatus"`
+	ChangedAt time.Time `json:"ChangedAt"`
+	Reason    string    `json:"Reason"`
 }
 
 // BookingJobConfirmed -- событие подтверждения бронирования от Catalog.
@@ -49,9 +61,16 @@ const (
 
 // QueueSuffixes для входящих событий — читаемые имена суффиксов очередей.
 const (
-	QueueSuffixBookingJobConfirmed = "booking-job.confirmed"
-	QueueSuffixBookingJobDenied    = "booking-job.denied"
+	QueueSuffixBookingJobConfirmed    = "booking-job.confirmed"
+	QueueSuffixBookingJobDenied       = "booking-job.denied"
+	QueueSuffixCancelBookingJobError  = "booking-job.cancel.error"
 )
+
+// RoutingKeyCancelBookingJobError — routing key для DLQ-очереди ошибок отмены.
+const RoutingKeyCancelBookingJobError = "booking-job.cancel.error"
+
+// RoutingKeyBookingStatusChanged — routing key для событий изменения статуса бронирования.
+const RoutingKeyBookingStatusChanged = "BookingService.Booking.Events.BookingStatusChangedEvent, BookingService.Booking.Events"
 
 // Routing keys и типы для исходящих команд в Catalog (publisher side, Rebus convention).
 const (

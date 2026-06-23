@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -12,15 +13,17 @@ import (
 
 // BookingsQueries обрабатывает запросы (чтение данных) для бронирований.
 type BookingsQueries struct {
-	repo   models.BookingRepository
-	logger *zap.Logger
+	repo        models.BookingRepository
+	historyRepo models.BookingHistoryRepository
+	logger      *zap.Logger
 }
 
 // NewBookingsQueries создаёт новый BookingsQueries.
-func NewBookingsQueries(repo models.BookingRepository, logger *zap.Logger) *BookingsQueries {
+func NewBookingsQueries(repo models.BookingRepository, historyRepo models.BookingHistoryRepository, logger *zap.Logger) *BookingsQueries {
 	return &BookingsQueries{
-		repo:   repo,
-		logger: logger,
+		repo:        repo,
+		historyRepo: historyRepo,
+		logger:      logger,
 	}
 }
 
@@ -82,6 +85,71 @@ func (q *BookingsQueries) GetByFilter(ctx context.Context, req dto.GetBookingsBy
 		TotalCount: totalCount,
 		Page:       filter.Page,
 		Size:       filter.Size,
+	}, nil
+}
+
+// GetStatistics возвращает агрегированную статистику бронирований за период.
+func (q *BookingsQueries) GetStatistics(ctx context.Context, dateFrom, dateTo time.Time) (dto.BookingStatisticsResponse, error) {
+	stats, err := q.repo.GetStatistics(ctx, dateFrom, dateTo)
+	if err != nil {
+		return dto.BookingStatisticsResponse{}, fmt.Errorf("получение статистики: %w", err)
+	}
+
+	response := dto.BookingStatisticsResponse{
+		TotalBookings: stats.TotalBookings,
+		ByStatus: dto.BookingStatusStats{
+			AwaitConfirmation:   stats.ByStatus[models.BookingStatusAwaitsConfirmation],
+			Confirmed:           stats.ByStatus[models.BookingStatusConfirmed],
+			Cancelled:           stats.ByStatus[models.BookingStatusCancelled],
+			CancellationPending: stats.ByStatus[models.BookingStatusCancellationPending],
+		},
+		TopResources: make([]dto.ResourceBookingCount, 0, len(stats.TopResources)),
+	}
+
+	for _, r := range stats.TopResources {
+		response.TopResources = append(response.TopResources, dto.ResourceBookingCount{
+			ResourceID:    r.ResourceID,
+			BookingsCount: r.BookingsCount,
+		})
+	}
+
+	return response, nil
+}
+
+// GetHistory возвращает историю изменений бронирования с пагинацией.
+func (q *BookingsQueries) GetHistory(ctx context.Context, bookingID int64, page, pageSize int) (dto.BookingHistoryResponse, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+
+	entries, total, err := q.historyRepo.GetByBookingID(ctx, bookingID, page, pageSize)
+	if err != nil {
+		return dto.BookingHistoryResponse{}, fmt.Errorf("получение истории бронирования: %w", err)
+	}
+
+	items := make([]dto.BookingHistoryItem, 0, len(entries))
+	for _, e := range entries {
+		item := dto.BookingHistoryItem{
+			ID:          e.ID,
+			NewStatus:   string(e.NewStatus),
+			ChangedAt:   e.ChangedAt.Format("2006-01-02T15:04:05Z07:00"),
+			Reason:      e.Reason,
+			InitiatedBy: e.InitiatedBy,
+		}
+		if e.OldStatus != nil {
+			s := string(*e.OldStatus)
+			item.OldStatus = &s
+		}
+		items = append(items, item)
+	}
+
+	return dto.BookingHistoryResponse{
+		BookingID:  bookingID,
+		TotalCount: total,
+		Items:      items,
 	}, nil
 }
 

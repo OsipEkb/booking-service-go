@@ -42,7 +42,7 @@ func (h *BookingConfirmedHandler) Handle(ctx context.Context, body []byte) error
 		zap.Int64("catalogJobId", event.Id),
 	)
 
-	if err := h.service.Confirm(ctx, bookingID); err != nil {
+	if err := h.service.Confirm(ctx, bookingID, event.EventId); err != nil {
 		return fmt.Errorf("подтверждение бронирования %d: %w", bookingID, err)
 	}
 
